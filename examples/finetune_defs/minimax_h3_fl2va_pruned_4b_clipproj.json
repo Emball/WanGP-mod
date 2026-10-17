@@ -1,0 +1,18 @@
+{
+    "model": {
+        "name": "MiniMax H3 FL2VA Pruned W4A8 + Qwen3-VL 4B ClipProj",
+        "architecture": "minimax_h3_fl2va_pruned",
+        "description": "MiniMax H3 FL2VA Pruned W4A8 using the local Qwen3-VL 4B encoder with MiniMax H3 ClipProj conditioning.",
+        "URLs": [
+            "minimax_h3_fl2va_pruned_w4a8_mixed.safetensors"
+        ],
+        "text_encoder_URLs": [
+            "qwen3vl_4b_fp8_scaled.safetensors"
+        ],
+        "clipproj_file": "mmh3-4b-ClipProj-celeb-mlp.safetensors",
+        "video_vae_file": "minimax_h3_video_vae_fp16.safetensors",
+        "audio_vae_file": "minimax_h3_audio_vae_fp32.safetensors"
+    },
+    "guidance_phases": 1,
+    "prompt": "integrated_multimodal_description: [Shot 1] A five-second cinematic single take inside a rain-lashed glass observatory at midnight. A radio astronomer sits before an antique brass receiver while electric-blue constellations drift across a translucent star map behind her. The camera makes a slow push from medium shot to close-up as the receiver emits three precise tones. She leans toward its microphone, looks up with sudden hope, and says clearly (S1) <d>[English] If you can hear me, follow this signal.</d> While finishing the line, she presses the transmit key; one brilliant blue pulse races across the star map and lights her restrained smile. Her speech completes naturally within the shot with precise lip synchronization.\noverall_soundscape: Rain rattling across the observatory dome, a low electrical hum, three clean receiver tones, a brass switch clicking, the astronomer's synchronized voice, and a short stereo transmission pulse.\nnon_diegetic_music: One quiet bowed-glass chord rising beneath the transmission and fading at the end."
+}

@@ -85,8 +85,32 @@ def _strip_wrappers(state_dict, quantization_map=None, tied_weights_map=None, qk
 
 
 def _strip_text_encoder_wrapper(state_dict, quantization_map=None, tied_weights_map=None):
-    root = "language_model" if "model.embed_tokens.weight" in state_dict else ""
-    return tuple(offload.map_state_dict([state_dict, quantization_map, tied_weights_map], rules={"model": root}))
+    """Normalize Comfy/Qwen single-file key layouts into MiniMax H3 module names.
+
+    Comfy's Qwen3-VL-4B single-file checkpoint uses the plain text-model root
+    (for example ``model.layers.*`` / ``model.embed_tokens.*``), while the
+    MiniMaxH3TextEncoder owns that network under ``language_model``.  Some
+    variants may also carry one extra wrapper such as ``model.language_model``
+    or ``language_model.model``.  Normalize all of those here instead of
+    relying on one exact sentinel key.
+    """
+    def normalize(mapping):
+        if mapping is None:
+            return None
+        result = {}
+        for key, value in mapping.items():
+            if key.startswith("model.language_model."):
+                key = "language_model." + key[len("model.language_model."):]
+            elif key.startswith("language_model.model."):
+                key = "language_model." + key[len("language_model.model."):]
+            elif key.startswith(("model.layers.", "model.embed_tokens.", "model.norm.")):
+                key = "language_model." + key[len("model."):]
+            elif key.startswith("model.visual."):
+                key = "visual." + key[len("model.visual."):]
+            result[key] = value
+        return result
+
+    return tuple(normalize(mapping) for mapping in (state_dict, quantization_map, tied_weights_map))
 
 
 def probe_h3_checkpoint(filename):
@@ -180,17 +204,96 @@ def _load_transformer(filename, dtype, qkv_splitting=True, qkv_layout="interleav
     return transformer
 
 
-def _load_text_encoder(filename, dtype):
-    config_path = fl.locate_file(os.path.join(TEXT_ENCODER_FOLDER, "config.json"))
-    config = load_h3_qwen_config(config_path)
-    with init_empty_weights(include_buffers=True):
-        text_encoder = MiniMaxH3TextEncoder(config)
+def _find_local_qwen_tokenizer(explicit_folder=None):
+    """Find an already-downloaded Qwen3-VL tokenizer without downloading anything."""
+    def valid_dir(path):
+        return os.path.isdir(path) and os.path.isfile(os.path.join(path, "tokenizer.json"))
+
+    if explicit_folder:
+        path = fl.locate_folder(explicit_folder, error_if_none=False) if not os.path.isabs(explicit_folder) else explicit_folder
+        if path and valid_dir(path):
+            return path
+        raise FileNotFoundError(
+            f"MiniMax H3 Qwen tokenizer folder '{explicit_folder}' was not found or has no tokenizer.json. "
+            "Point tokenizer_folder at an existing Qwen3-VL tokenizer directory."
+        )
+
+    roots = []
+    try:
+        roots.append(os.path.abspath(fl.get_smart_download_root()))
+    except Exception:
+        pass
+    for env_name in ("HF_HOME", "TRANSFORMERS_CACHE"):
+        value = os.environ.get(env_name)
+        if value:
+            roots.append(os.path.abspath(value))
+    roots.append(os.path.abspath(os.path.expanduser("~/.cache/huggingface/hub")))
+
+    names = ("Qwen3-VL-4B-Instruct", "Qwen3-VL-32B-Instruct")
+    seen = set()
+    for root in roots:
+        root_key = os.path.normcase(os.path.normpath(root))
+        if root_key in seen or not os.path.isdir(root):
+            continue
+        seen.add(root_key)
+
+        # Fast path for the normal Wan2GP ckpts layout.
+        for name in names:
+            candidate = os.path.join(root, name)
+            if valid_dir(candidate):
+                return candidate
+
+        # Also accept a tokenizer stored directly in the checkpoint root.
+        if valid_dir(root):
+            return root
+
+        # Search a bounded depth for an already-downloaded tokenizer snapshot.
+        root_depth = root.rstrip(os.sep).count(os.sep)
+        for current, dirs, files in os.walk(root):
+            depth = current.rstrip(os.sep).count(os.sep) - root_depth
+            if depth > 5:
+                dirs[:] = []
+                continue
+            dirs[:] = [d for d in dirs if d not in {"__pycache__", ".git"}]
+            if "tokenizer.json" in files:
+                low = current.lower()
+                if "qwen3-vl" in low or any(n.lower() in low for n in names):
+                    return current
+
+    raise FileNotFoundError(
+        "No local Qwen3-VL tokenizer was found. The 4B .safetensors file does not contain the tokenizer. "
+        "Put an existing Qwen3-VL-4B/32B tokenizer folder under E:\\Wan2GP\\ckpts\\, or set tokenizer_folder "
+        "to its existing location. No download is attempted by this patch."
+    )
+
+
+def _load_text_encoder(filename, dtype, clipproj_filename=None, tokenizer_folder=None):
+    from .text_encoder import load_h3_qwen4b_config
+
+    if clipproj_filename is not None:
+        clipproj_path = fl.locate_file(clipproj_filename)
+        if clipproj_path is None:
+            raise FileNotFoundError(
+                f"MiniMax H3 ClipProj matrix '{clipproj_filename}' was not found. "
+                "Put the .safetensors file under ckpts\\ or specify a valid local path."
+            )
+        config_path = os.path.join(os.path.dirname(__file__), "qwen3_vl_4b_config.json")
+        config = load_h3_qwen4b_config(config_path)
+        with init_empty_weights(include_buffers=True):
+            text_encoder = MiniMaxH3TextEncoder(config, clipproj_filename=clipproj_path, clipproj_tap=24)
+    else:
+        config_path = fl.locate_file(os.path.join(TEXT_ENCODER_FOLDER, "config.json"))
+        config = load_h3_qwen_config(config_path)
+        with init_empty_weights(include_buffers=True):
+            text_encoder = MiniMaxH3TextEncoder(config)
     text_encoder.visual.rotary_pos_emb.reset_inv_freq()
     text_encoder.language_model.rotary_emb.reset_inv_freq()
     text_encoder.requires_grad_(False)
     offload.load_model_data(text_encoder, filename, writable_tensors=False, default_dtype=dtype,
                             preprocess_sd=_strip_text_encoder_wrapper, ignore_unused_weights=True)
-    text_encoder.set_tokenizer(os.path.dirname(config_path))
+    tokenizer_path = _find_local_qwen_tokenizer(tokenizer_folder)
+    print(f"MiniMax H3 Qwen tokenizer: {tokenizer_path}")
+    text_encoder.set_tokenizer(tokenizer_path)
     text_encoder.eval().requires_grad_(False)
     return text_encoder
 
@@ -241,8 +344,25 @@ def _load_audio_vae(filename):
                 state_dict[key.removesuffix("weight_g") + "parametrizations.weight.original0"] = state_dict.pop(key)
             elif key.endswith(".weight_v"):
                 state_dict[key.removesuffix("weight_v") + "parametrizations.weight.original1"] = state_dict.pop(key)
+        suffix = ".parametrizations.weight.original0"
+        converted = 0
+        for key, expected in expected_shapes.items():
+            if not key.endswith(suffix) or key in state_dict:
+                continue
+            prefix = key[:-len(suffix)]
+            weight = state_dict.pop(prefix + ".weight", None)
+            if weight is None:
+                continue
+            dim = next((i for i, size in enumerate(expected) if size != 1), 0)
+            weight = weight.to(torch.float32)
+            state_dict[key] = torch.norm_except_dim(weight, 2, dim)
+            state_dict[prefix + ".parametrizations.weight.original1"] = weight
+            converted += 1
+        if converted:
+            print(f"MiniMax H3 audio VAE: re-parametrized {converted} fused weight-norm layers")
         return state_dict
 
+    expected_shapes = {k: tuple(v.shape) for k, v in vae.state_dict().items()}
     offload.load_model_data(vae, filename, writable_tensors=False, default_dtype=torch.float32, preprocess_sd=preprocess)
     vae.eval().requires_grad_(False)
     return vae
@@ -265,10 +385,10 @@ def model_factory(model_filename, text_encoder_filename, qkv_splitting, dtype=to
                   model_type="minimax_h3_fl2va", reference_mode=False, video_vae_filename=VIDEO_VAE_FILE,
                   audio_vae_filename=AUDIO_VAE_FILE, latent_upscaler_filename=os.path.join(LATENT_UPSCALER_FOLDER, LATENT_UPSCALER_FILE),
                   shared_h3_pipeline=None, qkv_layout="interleaved", pdd=False, pdd_num_steps=None, pdd_block_size=None, vdn=False, audio_only=False,
-                  fixed_prompt_filename=None):
+                  fixed_prompt_filename=None, clipproj_filename=None, tokenizer_folder=None):
     transformer = _load_transformer(model_filename, dtype, qkv_splitting, qkv_layout, pdd, pdd_num_steps, pdd_block_size, vdn)
     if shared_h3_pipeline is None:
-        text_encoder = _load_text_encoder(text_encoder_filename, dtype) if fixed_prompt_filename is None else None
+        text_encoder = _load_text_encoder(text_encoder_filename, dtype, clipproj_filename=clipproj_filename, tokenizer_folder=tokenizer_folder) if fixed_prompt_filename is None else None
         video_vae_qkv_splitting = qkv_splitting and video_vae_filename in (VIDEO_VAE_FILE, X2_VAE_FILE)
         video_vae = _load_video_vae(video_vae_filename, video_vae_qkv_splitting, upsampling=video_vae_filename in (X2_VAE_FILE, X2_VAE_INT8_FILE))
         audio_vae = _load_audio_vae(audio_vae_filename)

@@ -24,6 +24,7 @@ from .constants import (H3_AUDIO_REFINEMENT_DENOISE, H3_AUDIO_REFINEMENT_SETTING
                         H3_PHASE_2_NOISE_LEVEL_START_DEFAULT, h3_grouped_masking_enabled)
 from .dialogue import H3_DIALOGUE_GENERATION, generate_dialogue, is_dialogue_prompt
 from .excerpts import H3_AUDIO_EXCERPTS_SETTING, H3_VIDEO_EXCERPTS_SETTING, parse_excerpts, reference_video_frame_limit
+from .refmods import H3_REFMODS_SETTING, load_refmods, ref_entry, split_mods
 from .first_block_cache import MiniMaxH3FirstBlockCache
 from .interrupt import GenerationInterrupted
 from .pdd import pdd_sampling_plans, pdd_sampling_plans_for_sigmas
@@ -1030,6 +1031,10 @@ class MiniMaxH3Pipeline:
             self._add_video_reference(_resize_video(source, height, width), soundtracks[index], fps, presentation, visual_latents, audio_latents, refs)
         if self.fixed_prompt is not None:
             self._add_image_reference(input_ref_images[0], width, height, 100, presentation, visual_latents, refs)
+        refmod_visual, refmod_audio = split_mods(load_refmods((custom_settings or {}).get(H3_REFMODS_SETTING)))
+        for mod in refmod_visual:
+            visual_latents.append(mod["latent"])
+            refs.append(ref_entry(mod))
         reference_sources = []
         if self.reference_mode and self.fixed_prompt is None and not refinement_mode and "A" in (audio_prompt_type or "") and not soundtrack:
             reference_sources.append(audio_guide if audio_guide is not None else waveform)
@@ -1048,6 +1053,10 @@ class MiniMaxH3Pipeline:
                 reference_sources.append(self._waveform(audio, sample_rate))
         for reference_audio in self._prepare_audio_references(reference_sources):
             self._add_audio_reference(reference_audio, presentation, audio_latents, refs)
+        for mod in refmod_audio:
+            presentation.append({"type": "audio"})
+            audio_latents.append(mod["latent"])
+            refs.append(ref_entry(mod))
         if (refinement_mode or soundtrack or not self.reference_mode or self.fixed_prompt is not None) and any(flag in (audio_prompt_type or "") for flag in "AK") and waveform is not None:
             condition_start = round(history_count / fps * AUDIO_SAMPLE_RATE)
             condition_samples = round(target_frames / fps * AUDIO_SAMPLE_RATE)
@@ -1445,9 +1454,19 @@ class MiniMaxH3Pipeline:
                 for phase_2_ref, original_ref in zip(phase_2_refs, visual_refs):
                     phase_2_ref["kind"] = original_ref["kind"]
                     phase_2_ref["ref_audio_t"] = original_ref.get("ref_audio_t", 0)
+                for mod in refmod_visual:
+                    phase_2_reference_latents.append(mod["latent"])
+                    phase_2_refs.append(ref_entry(mod))
                 for audio_ref in (ref for ref in refs if ref["kind"] == "audio"):
                     phase_2_reference_presentation.append({"type": "audio"})
                     phase_2_refs.append(audio_ref)
+            else:
+                for mod in refmod_visual:
+                    phase_2_reference_latents.append(mod["latent"])
+                    phase_2_refs.append(ref_entry(mod))
+                for mod in refmod_audio:
+                    phase_2_reference_presentation.append({"type": "audio"})
+                    phase_2_refs.append(ref_entry(mod))
             phase_2_presentation = []
             phase_2_visual_latents, keyframes = prepare_keyframes(target_height, target_width, phase_2_presentation)
             phase_2_keyframe_count = len(keyframes)

@@ -10,6 +10,7 @@ from shared.utils.hf import build_hf_url
 from shared.utils.frame_scheduler import normalize_overlap
 
 from .excerpts import H3_AUDIO_EXCERPTS_SETTING, H3_EXCERPT_SETTINGS, H3_VIDEO_EXCERPTS_SETTING, parse_excerpts, reference_video_frame_limit
+from .refmods import H3_REFMODS_SETTING
 from .constants import (H3_AUDIO_REFINEMENT_SETTING, H3_CONTROL_LATENT_CONTINUATION, H3_MASK_MODE_DEFAULT, H3_MASK_MODE_GROUPED_ROWS,
                         H3_MASK_MODE_SHARED_TIMESTEP, H3_MASK_MODE_SETTING, H3_PHASE_2_NOISE_LEVEL_START_DEFAULT,
                         h3_grouped_masking_enabled)
@@ -605,6 +606,12 @@ class family_handler:
                     ("Enabled (6 extra steps, denoising 0.5)", "enabled"),
                 ],
                 "audio_prompt_type_not": "S" if reference_mode else "AK",
+            }, {
+                "id": H3_REFMODS_SETTING,
+                "name": "RefMods",
+                "label": "RefMods (files from the refmods folder, comma separated, optional #visual / #audio and :strength, e.g. alice, bob:0.8)",
+                "type": "text",
+                "default": "",
             }],
             "switch_threshold": {
                 "label": "Phase 2 Noise Level Start",
@@ -1070,11 +1077,17 @@ class family_handler:
         if vae_files:
             source_folders.append("")
             file_lists.append(vae_files)
-        if base_model_type != VIGGLE_ARCHITECTURE:
+        if base_model_type != VIGGLE_ARCHITECTURE and not model_def.get("clipproj_file"):
             source_folders.append(TEXT_ENCODER_FOLDER)
             file_lists.append(["config.json", "tokenizer.json", "tokenizer_config.json", "preprocessor_config.json", "vocab.json"])
             source_folders.append(LATENT_UPSCALER_FOLDER)
             file_lists.append([LATENT_UPSCALER_FILE])
+        elif base_model_type != VIGGLE_ARCHITECTURE:
+            # ClipProj 4B local-assets mode deliberately does not trigger any
+            # automatic Hugging Face downloads. The tokenizer must already exist
+            # in the configured local tokenizer_folder, and the latent upscaler
+            # must already exist if two-phase generation is selected.
+            pass
         downloads = [{
             "repoId": REPO_ID,
             "sourceFolderList": source_folders,
@@ -1113,7 +1126,9 @@ class family_handler:
                                  audio_vae_filename=model_def.get("audio_vae_file", AUDIO_VAE_FILE), shared_h3_pipeline=shared_h3_pipeline,
                                  pdd=pdd, pdd_num_steps=PDD_NUM_STEPS if pdd else None, pdd_block_size=PDD_BLOCK_SIZE if pdd else None,
                                  vdn=model_def.get("vdn", False), audio_only=base_model_type == TTS_REF2VA_PRUNED_ARCHITECTURE,
-                                 fixed_prompt_filename=os.path.join(VIGGLE_ASSET_FOLDER, VIGGLE_PROMPT_FILE) if viggle else None)
+                                 fixed_prompt_filename=os.path.join(VIGGLE_ASSET_FOLDER, VIGGLE_PROMPT_FILE) if viggle else None,
+                                 clipproj_filename=model_def.get("clipproj_file"),
+                                 tokenizer_folder=model_def.get("tokenizer_folder"))
         pipe = {"transformer": pipeline.transformer}
         if base_model_type == TTS_REF2VA_PRUNED_ARCHITECTURE and H3_DIALOGUE_GENERATION:
             pipeline.dialogue_whisper = load_dialogue_whisper()

@@ -552,6 +552,12 @@ class MiniMaxH3Model(nn.Module):
         converted = {}
         for key, value in state_dict.items():
             key = key.replace(".lora_A.turbo.weight", ".lora_A.weight").replace(".lora_B.turbo.weight", ".lora_B.weight")
+            for flat, dotted in (("final_layer_audio_out.", "final_layer.audio_out."),
+                                 ("final_layer_video_out.", "final_layer.video_out.")):
+                for pre in ("", "diffusion_model.", "transformer."):
+                    if key.startswith(pre + flat):
+                        key = pre + dotted + key[len(pre + flat):]
+                        break
             if key.startswith("lora_unet_"):
                 path, suffix = key[len("lora_unet_"):].split(".", 1)
                 key = path.replace("blocks_", "blocks.", 1).replace("_attn_", ".attn.").replace("_mlp_", ".mlp.") + "." + suffix

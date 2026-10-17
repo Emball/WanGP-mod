@@ -1,10 +1,13 @@
 """Qwen3-VL conditioning used by MiniMax H3."""
 
 import math
+import os
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from safetensors import safe_open
+from safetensors.torch import load_file as load_safetensors
 from transformers import AutoTokenizer
 
 from models.ideogram4.qwen3_vl_configuration import Qwen3VLConfig
@@ -31,6 +34,118 @@ def load_h3_qwen_config(config_path):
     config.text_config.use_cache = False
     config.vision_config.out_hidden_size = config.text_config.hidden_size
     return config
+
+
+def load_h3_qwen4b_config(config_path):
+    """Load the stock Qwen3-VL-4B config used by MiniMax-H3 ClipProj.
+
+    The 4B model is a normal 36-layer Qwen3-VL text/vision model. Unlike the
+    official H3 encoder it is not truncated to 50 layers; ClipProj reads an
+    intermediate hidden state (normally layer 24) and maps its 2560 channels
+    into H3's 5120-channel conditioning space.
+    """
+    config = Qwen3VLConfig.from_json_file(config_path)
+    config.text_config.use_cache = False
+    config.vision_config.out_hidden_size = config.text_config.hidden_size
+    if config.text_config.hidden_size != 2560 or config.text_config.num_hidden_layers != 36:
+        raise ValueError(
+            "The bundled H3 ClipProj config is expected to be Qwen3-VL-4B "
+            "(hidden_size=2560, num_hidden_layers=36), but loaded "
+            f"hidden_size={config.text_config.hidden_size}, "
+            f"num_hidden_layers={config.text_config.num_hidden_layers}."
+        )
+    return config
+
+
+_PROJECTION_META_TYPES = {
+    "tap": int,
+    "d_in": int,
+    "d_out": int,
+}
+
+
+def _load_clipproj_projection(filename):
+    """Load a ClipProj .safetensors matrix into CPU tensors.
+
+    Supports both the original linear+MLP files and newer residual-only MLP
+    files. Metadata values are stored as strings by safetensors, so restore
+    the small set of numeric fields that affect execution.
+    """
+    filename = os.path.abspath(filename)
+    data = load_safetensors(filename, device="cpu")
+    with safe_open(filename, framework="pt", device="cpu") as handle:
+        metadata = handle.metadata() or {}
+    for key, value in metadata.items():
+        caster = _PROJECTION_META_TYPES.get(key)
+        if caster is not None:
+            try:
+                data[key] = caster(value)
+            except (TypeError, ValueError):
+                pass
+
+    for key in ("mean_in", "std_in", "mean_out", "std_out", "tap"):
+        if key not in data:
+            raise KeyError(f"ClipProj file '{filename}' is missing required key '{key}'")
+    for key in ("W", "mean_in", "std_in", "mean_out", "std_out"):
+        if key in data and torch.is_tensor(data[key]):
+            data[key] = data[key].float()
+    return data
+
+
+def _build_clipproj_residual(proj, device):
+    layers = sorted({
+        int(key.split(".")[1])
+        for key in proj
+        if key.startswith("mlp.") and len(key.split(".")) >= 3 and key.split(".")[1].isdigit()
+    })
+    if not layers:
+        return None
+    modules = []
+    for pos, index in enumerate(layers):
+        weight = proj[f"mlp.{index}.weight"]
+        linear = nn.Linear(weight.shape[1], weight.shape[0], bias=f"mlp.{index}.bias" in proj)
+        linear.weight.data.copy_(weight.to(device=device))
+        if linear.bias is not None:
+            linear.bias.data.copy_(proj[f"mlp.{index}.bias"].to(device=device))
+        modules.append(linear)
+        if pos < len(layers) - 1:
+            modules.append(nn.GELU())
+    network = nn.Sequential(*modules).to(device=device)
+    network.eval().requires_grad_(False)
+    return network
+
+
+def _apply_clipproj(proj, hidden):
+    """Map Qwen3-VL-4B activations into MiniMax-H3 conditioning space."""
+    if hidden.ndim != 3:
+        raise ValueError(f"ClipProj expected [batch, seq, hidden], got {tuple(hidden.shape)}")
+    d_in = int(proj["mean_in"].shape[0])
+    d_out = int(proj["mean_out"].shape[0])
+    if hidden.shape[-1] != d_in:
+        raise ValueError(f"ClipProj input mismatch: encoder produced {hidden.shape[-1]} channels, projection expects {d_in}")
+    if d_out != 5120:
+        raise ValueError(f"MiniMax H3 ClipProj must produce 5120 channels, projection produces {d_out}")
+
+    device = hidden.device
+    x = hidden.float()
+    mean_in = proj["mean_in"].to(device=device)
+    std_in = proj["std_in"].to(device=device)
+    mean_out = proj["mean_out"].to(device=device)
+    std_out = proj["std_out"].to(device=device)
+    normalized = (x - mean_in) / std_in
+
+    if "W" in proj:
+        projected = normalized @ proj["W"].to(device=device)
+    else:
+        # v3/v3.1 residual-only matrices deliberately omit W.
+        projected = torch.zeros((*x.shape[:-1], d_out), device=device, dtype=torch.float32)
+
+    residual = _build_clipproj_residual(proj, device)
+    if residual is not None:
+        residual_dtype = next(residual.parameters()).dtype
+        projected = projected + residual(normalized.to(dtype=residual_dtype)).float()
+
+    return (projected * std_out + mean_out).to(dtype=hidden.dtype)
 
 
 def _visual_patches(frames, video=False, patch_size=16, temporal_patch_size=2, merge_size=2):
@@ -90,9 +205,14 @@ def _mrope_positions(visuals, seq_len, device):
 
 
 class MiniMaxH3TextEncoder(nn.Module):
-    """Qwen3-VL-32B truncated after language layer 50, without final RMSNorm."""
+    """Qwen3-VL conditioning used by MiniMax H3.
 
-    def __init__(self, config):
+    The same class handles the stock 32B/50-layer encoder and the optional
+    4B+ClipProj path. The latter captures an intermediate 4B hidden state and
+    projects it into the 5120-dimensional H3 conditioning space.
+    """
+
+    def __init__(self, config, clipproj_filename=None, clipproj_tap=24):
         super().__init__()
         self.config = config
         self.visual = Qwen3VLVisionModel(config.vision_config)
@@ -100,6 +220,18 @@ class MiniMaxH3TextEncoder(nn.Module):
         self.language_model.norm = _RawHiddenState()
         self.tokenizer = None
         self._interrupt = False
+        self.clipproj_filename = clipproj_filename
+        self._clipproj = _load_clipproj_projection(clipproj_filename) if clipproj_filename is not None else None
+        self.clipproj_tap = int(self._clipproj.get("tap", clipproj_tap)) if self._clipproj is not None else None
+        if self._clipproj is not None:
+            print(
+                f"MiniMax H3 ClipProj: 4B encoder -> 5120 conditioning, tap={self.clipproj_tap}, "
+                f"d_in={self._clipproj['mean_in'].shape[0]}, d_out={self._clipproj['mean_out'].shape[0]}, "
+                f"linear={'yes' if 'W' in self._clipproj else 'no'}, "
+                f"residual={'yes' if any(k.startswith('mlp.') for k in self._clipproj) else 'no'}"
+            )
+        if self._clipproj is not None and self.clipproj_tap < 0:
+            raise ValueError(f"Invalid ClipProj tap {self.clipproj_tap}")
 
     @property
     def _interrupt(self):
@@ -114,7 +246,20 @@ class MiniMaxH3TextEncoder(nn.Module):
             self.language_model._interrupt = self._abort
 
     def set_tokenizer(self, tokenizer_path):
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=False)
+        # Qwen3-VL uses the Qwen2 tokenizer backend. A complete local model
+        # folder is preferred, but a standalone tokenizer.json is also enough
+        # for this H3 path because we only need text -> input_ids.
+        if os.path.isfile(tokenizer_path) and tokenizer_path.lower().endswith(".json"):
+            from transformers import Qwen2TokenizerFast
+            self.tokenizer = Qwen2TokenizerFast(
+                tokenizer_file=tokenizer_path,
+                unk_token="<|endoftext|>",
+                eos_token="<|im_end|>",
+                pad_token="<|endoftext|>",
+                bos_token=None,
+            )
+        else:
+            self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=False, local_files_only=True)
 
     def _token_ids(self, text):
         if self.tokenizer is None:
@@ -207,12 +352,23 @@ class MiniMaxH3TextEncoder(nn.Module):
 
         positions = _mrope_positions(visuals, embeds.shape[1], device)
         self.language_model._interrupt = self._interrupt
+        return_layers = [self.clipproj_tap] if self._clipproj is not None else None
+        if return_layers is not None and self.clipproj_tap >= len(self.language_model.layers):
+            raise ValueError(
+                f"ClipProj tap {self.clipproj_tap} is out of range for a {len(self.language_model.layers)}-layer encoder"
+            )
         with text_encoding_progress(self.language_model.layers):
             output = self.language_model(inputs_embeds=embeds, position_ids=positions, visual_pos_masks=visual_mask if visuals else None,
-                                         deepstack_visual_embeds=deepstack, use_cache=False)
+                                         deepstack_visual_embeds=deepstack, use_cache=False,
+                                         return_mid_results_layers=return_layers)
         if output.last_hidden_state is None:
             raise GenerationInterrupted
+        if self._clipproj is not None:
+            if not getattr(output, "mid_results", None):
+                raise RuntimeError(f"Qwen3-VL did not return ClipProj tap {self.clipproj_tap}")
+            hidden = output.mid_results[0]
+            return _apply_clipproj(self._clipproj, hidden), tags
         return output.last_hidden_state.to(dtype), tags
 
 
-__all__ = ["MiniMaxH3TextEncoder", "load_h3_qwen_config"]
+__all__ = ["MiniMaxH3TextEncoder", "load_h3_qwen_config", "load_h3_qwen4b_config"]
