@@ -130,18 +130,22 @@ Queue completed: 3/3 tasks in 5m 23s
 
 ```bash
 --mcp                              # Start WanGP as an MCP server without the web UI
---mcp-transport TRANSPORT          # stdio, sse, or streamable-http
+--mcp-webui                        # Override Agents config: enable MCP with the web UI
+--no-mcp-webui                     # Override Agents config: disable MCP with the web UI
+--mcp-transport TRANSPORT          # stdio (default with --mcp), sse, or streamable-http (default with the web UI)
 --mcp-host HOST                    # Host for HTTP transports
---mcp-port PORT                    # Port for HTTP transports
---mcp-api-version {1,2}            # WanGP API contract; latest (2) by default, 1 for compatibility
---mcp-async                        # Permit wait=false in v2; disabled by default
+--mcp-port PORT                    # Override Configuration > Agents port for HTTP transports (default: 8000)
+--mcp-api-version {1,2,2.1}        # WanGP API contract; latest (2.1) by default
+--mcp-async                        # Permit wait=false in v2/v2.1; disabled by default
 --mcp-console-output               # Mirror WanGP output while serving MCP
 --mcp-allow-read-file-system       # Allow agents to submit arbitrary server file paths (disabled by default)
 ```
 
-Media IDs returned by the Gallery remain usable when filesystem reads are disabled. Streamable HTTP and SSE servers also expose short-lived Gallery upload/download URLs; stdio does not provide HTTP media transfer.
+MCP is off by default with the web UI, including after upgrading. Control autostart with **Enable MCP with Web UI** under **Configuration > Agents**. When enabled, agents' generations join the queue shown in the browser, run after the tasks already waiting and appear in every open page's progress and preview; their outputs go to the agent's workspace without switching the gallery you are viewing. In this mode asynchronous calls are always available. Set **MCP Server Port** under **Configuration > Agents** and restart, or override it for one launch with `--mcp-port PORT`. `--mcp-webui` and `--no-mcp-webui` override the saved autostart choice for one launch without changing it. See [MCP server inside the web UI](API.md#mcp-server-inside-the-web-ui).
 
-The default MCP interface is now v2. Existing clients that use historical tool names or parameters must launch with `python wgp.py --mcp --mcp-api-version 1`. Use `--mcp-api-version 2` to pin v2 explicitly. Both `--mcp-api-version` and `--mcp-async` also work with `python -m shared.mcp_server`. The number selects the WanGP tool API, not the MCP protocol version; unsupported numbers are rejected. API v1 retains its original wait behavior. In v2, generation and post-processing wait by default; `--mcp-async` enables optional asynchronous calls without changing that default. See [API migration](API.md#mcp-api-v2-and-migration).
+Media IDs returned by the Gallery remain usable when unrestricted filesystem reads are disabled. V2.1 also provides output-folder reads and a writable session workspace. Streamable HTTP and SSE servers expose short-lived file and Gallery upload/download URLs; stdio downloads use binary MCP resources with byte-range support.
+
+The default MCP interface is v2.1, with `remux_media`, native visual inspection, file delivery and searchable documentation. Existing clients can pin an earlier contract with `--mcp-api-version 1` or `--mcp-api-version 2`. Both `--mcp-api-version` and `--mcp-async` also work with `python -m shared.mcp`. The number selects the WanGP tool API, not the MCP protocol version; unsupported versions are rejected. API v1 retains its original wait behavior. In v2/v2.1, generation and post-processing wait by default; `--mcp-async` enables optional asynchronous calls without changing that default. See [v2.1 additions](API.md#mcp-api-v21-additions) and [API migration](API.md#mcp-api-v2-and-migration).
 
 ### Examples
 ```bash
@@ -264,6 +268,13 @@ The setting applies when WanGP starts; `--ram-allocator` takes precedence over i
 ```
 On Windows, WanGP asks by default to keep its full CPU speed when its window is minimized or in the background. Windows may otherwise slow down a background application several times, which slows down generation on the steps where the GPU waits for the CPU. On a laptop running on battery, `--no-prevent-power-throttling` saves power at the cost of slower generations while WanGP is in the background.
 
+You can also change **Configuration / Performance / Prevent Windows Background Power Throttling**, then save and restart the server. It applies to the server process and all browser sessions, without raising process priority. Explicit `--prevent-power-throttling` or `--no-prevent-power-throttling` launch options override the saved choice. This is separate from **Continue Browser Actions in Background**, which lets pending interface actions and updates continue while the tab is in the background. Already-started generation queues run on the server and continue even when all browser tabs are closed, regardless of this browser option.
+
+### Compute Cache
+*Configuration / Performance / WanGP Compute Cache* (off by default, shown with RTX 50xx and other NVIDIA Blackwell GPUs). With these GPUs, PyTorch and the other GPU libraries ship their code in a form that the NVIDIA driver optimizes for the exact GPU each time WanGP starts, which costs about 10-15 seconds at the first generation. The driver keeps the result in a cache shared by every program and limited to 1 GB, where models push out one another's code and other programs trim it, so the work is done again after restarts and rewritten on the disk at each launch. Older GPUs run the shipped code as is and do not need this option.
+
+The option keeps this cache in a folder of its own: `ComputeCache` in the WanGP folder, or the *Compute Cache Folder* you choose (relative to the WanGP folder, or a full path). The code of each model is completed over its first few launches (the driver optimizes a limited amount per launch). After that, the first generation after a restart starts sooner, and nothing more is written to the disk at launch, which spares the SSD. It may take up to 2 GB of disk space. The setting applies when WanGP starts.
+
 ### Smart Memory Pinning
 *Configuration / RAM/VRAM Management / Smart Memory Pinning* (On by default) speeds up the models that the memory profile does not keep in Reserved RAM: the text encoders with Profile 4, every model with Profile 5, and the part of a model that does not fit when *Reserved RAM for Pinning* is low. With it, they reach the GPU almost as fast as the models kept in Reserved RAM, for about 1-2 GB of Reserved RAM.
 
@@ -321,7 +332,7 @@ JSON entries take precedence over `--loras`. Unlisted keys use the root from `--
 ```bash
 --settings PATH              # Path to folder containing default settings for all models
 --config PATH                # Config folder for wgp_config.json and queue.zip
---workspaces-dir FOLDER       # Gallery workspaces for Gradio/Web (default: ./workspaces)
+--workspaces-dir FOLDER       # Workspace manifests/media; overrides Config / Outputs (default: ./workspaces)
 --verbose LEVEL              # Information level 0-2 (default: 1)
 ```
 

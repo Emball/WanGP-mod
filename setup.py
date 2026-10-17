@@ -419,6 +419,7 @@ def install_logic(env_name, env_type, env_path, py_k, torch_k, triton_k, sage_k,
 
     if sage_k:
         cmd = resolve_cmd(config['components']['sage'][sage_k]['cmd'])
+        cmd = cmd.replace("{py}", "cp" + py_k.replace(".", ""))  # wheels built for each Python version
         if cmd.startswith("http") or cmd.startswith("sageattention"):
             run_cmd(f"{pip} {cmd}")
         else:
@@ -437,6 +438,12 @@ def install_logic(env_name, env_type, env_path, py_k, torch_k, triton_k, sage_k,
         if cmd: run_cmd(f"{pip} {cmd}")
 
     for k in kernel_list:
+        if k in ("wgpkernels", "wgpkernels_cu128", "wgpkernels_rocm10"):
+            k = {"cu130": "wgpkernels", "cu128": "wgpkernels_cu128", "rocm10": "wgpkernels_rocm10"}.get(torch_k)
+            if k is None:
+                continue
+            if k == "wgpkernels_rocm10" and not any(f"device-{arch}" in torch_cmd for arch in ("gfx1200", "gfx1201")):
+                continue
         if k in ("gguf", "gguf_cu128"):
             gguf_builds = {("cu130", "3.11"): "gguf", ("cu128", "3.10"): "gguf_cu128"}
             k = gguf_builds.get((torch_k, py_k))
@@ -1011,7 +1018,7 @@ def create_wgp_config(profile_key, config_data):
         elif "20" in profile_key:
             attn_mode = "sage"
 
-    compile_mode = ""
+    compile_mode = "disabled"
     # triton_key = prof_settings.get('triton')
     # if triton_key and triton_key != "none":
     #     compile_mode = "transformer"

@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# Modifications Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 
 import math
 
@@ -26,28 +27,14 @@ from diffusers.models.modeling_utils import ModelMixin
 from diffusers.utils import logging
 from diffusers.utils.accelerate_utils import apply_forward_hook
 
-from shared.attention import pay_attention, triton_installed, major, minor
+from shared.attention import pay_attention
 
 from ..interrupt import GenerationInterrupted
 from shared.utils.phase_progress import vae_encoding_progress, PhaseProgress
-from . import vae_kitchen
-from shared.kernels import kernel_policy, int8_backend
-
+from shared.kernels import ops as kernels, vae_ops
 
 logger = logging.get_logger(__name__)
-
-# Enable only on the architecture validated with real H3 checkpoints. Other
-# devices retain the established PyTorch implementation.
-USE_TRITON_VAE = triton_installed and (major, minor) == (12, 0)
-USE_KITCHEN_VAE = True
-# Kitchen INT8 fusions validated for this decoder with BF16 and FP16 activations.
 _FUSED_DTYPES = (torch.bfloat16, torch.float16)
-if USE_TRITON_VAE:
-    from . import vae_kernels
-
-
-def _use_triton_vae(x):
-    return USE_TRITON_VAE and x.is_cuda and x.dtype == torch.bfloat16 and torch.is_inference_mode_enabled()
 
 
 class MiniMaxH3VideoCausalConv3d(nn.Conv3d):
@@ -81,10 +68,8 @@ class MiniMaxH3VideoCausalConv3d(nn.Conv3d):
             )
         if self.temporal_padding > 0 and not pre_padded:
             hidden_states = F.pad(hidden_states, (0, 0, 0, 0, self.temporal_padding, 0), mode="constant")
-        if USE_KITCHEN_VAE and vae_kitchen.can_conv3d(hidden_states, self):
-            return vae_kitchen.conv3d(hidden_states, self, residual)
-        hidden_states = F.conv3d(hidden_states, self.weight, self.bias, stride=self.stride, padding=0, dilation=self.dilation)
-        return hidden_states if residual is None else hidden_states.add_(residual)
+        x_list, hidden_states = [hidden_states], None
+        return vae_ops.conv3d(x_list, self, residual)
 
 
 class MiniMaxH3VideoGroupNorm(nn.GroupNorm):
@@ -94,24 +79,8 @@ class MiniMaxH3VideoGroupNorm(nn.GroupNorm):
     """
 
     def forward(self, hidden_states: torch.Tensor, *, silu_pad=None) -> torch.Tensor:
-        if silu_pad is not None and USE_KITCHEN_VAE and vae_kitchen.available(hidden_states, self, silu_pad):
-            return vae_kitchen.group_norm_silu_pad3d(hidden_states, self, silu_pad)
-        batch_size, num_channels, num_frames, height, width = hidden_states.shape
-        hidden_states = hidden_states.permute(0, 2, 1, 3, 4).contiguous()
-        hidden_states = hidden_states.view(batch_size * num_frames, num_channels, 1, height, width)
-        hidden_states = super().forward(hidden_states)
-        if silu_pad is not None and _use_triton_vae(hidden_states):
-            left, right, top, bottom, front = silu_pad
-            if left == right == top == bottom and left < min(height, width):
-                return vae_kernels.silu_pad_frames(hidden_states, batch_size, num_frames, left, front)
-        hidden_states = hidden_states.view(batch_size, num_frames, num_channels, height, width)
-        hidden_states = hidden_states.permute(0, 2, 1, 3, 4).contiguous()
-        if silu_pad is not None:
-            left, right, top, bottom, front = silu_pad
-            hidden_states = F.silu(hidden_states)
-            hidden_states = F.pad(hidden_states, (left, right, top, bottom, 0, 0), mode="reflect")
-            hidden_states = F.pad(hidden_states, (0, 0, 0, 0, front, 0))
-        return hidden_states
+        x_list, hidden_states = [hidden_states], None
+        return vae_ops.frame_group_norm(x_list, self, silu_pad)
 
 
 def _norm_silu_conv(hidden_states: list[torch.Tensor], norm, conv, residual=None):
@@ -204,7 +173,10 @@ class MiniMaxH3VideoDownsample3d(nn.Module):
         if self.spatial_padding_mode != "reflect":
             return self.conv(F.pad(hidden_states, (0, 1, 0, 1, 0, 0), mode=self.spatial_padding_mode))
         front, (height, width) = self.conv.temporal_padding, hidden_states.shape[-2:]
-        padded = hidden_states.new_empty((*hidden_states.shape[:2], front + hidden_states.shape[2], height + 1, width + 1))
+        # channels-last activations (fused convolutions) keep their layout: the copies stay coalesced and the convolution reads the buffer as is
+        layout = torch.channels_last_3d if hidden_states.is_contiguous(memory_format=torch.channels_last_3d) else torch.contiguous_format
+        padded = torch.empty((*hidden_states.shape[:2], front + hidden_states.shape[2], height + 1, width + 1), dtype=hidden_states.dtype,
+                             device=hidden_states.device, memory_format=layout)
         padded[:, :, :front].zero_()
         frames = padded[:, :, front:]
         frames[..., :height, :width].copy_(hidden_states)
@@ -348,7 +320,7 @@ class MiniMaxH3VideoRotaryPosEmbed(nn.Module):
     def forward(self, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         angles = 2.0 * math.pi * position_ids[:, :, :, None] * self.inv_freq[None, None, None, :]
         angles = angles.flatten(2, 3).tile(2).unsqueeze(2)
-        return vae_kitchen.prepare_rotary(angles.cos(), angles.sin())
+        return vae_ops.prepare_rotary(angles.cos(), angles.sin())
 
 
 def _take(x_list: list[torch.Tensor]) -> torch.Tensor:
@@ -390,60 +362,41 @@ class MiniMaxH3VideoAttnProcessor:
     ) -> torch.Tensor:
         hidden_states = _take(hidden_states)
         batch_size, seq_len, _ = hidden_states.shape
-        fused = _use_triton_vae(hidden_states)
-        kitchen_rms = USE_KITCHEN_VAE and vae_kitchen.can_fuse_rms_rope(hidden_states, rotary_emb)
+        plan = vae_ops.rope_plan(hidden_states, attn.dim_head, rotary_emb)
 
         def normalize(projected, norm):
-            if kitchen_rms:
-                return projected
-            dtype = projected.dtype
-            normalized = norm(projected.float())
-            return vae_kernels.cast_rope(normalized, rotary_emb) if fused else normalized.to(dtype)
+            x_list, projected = [projected], None
+            return vae_ops.normalize_projection(x_list, norm, rotary_emb, plan)
 
         if hasattr(attn, "to_q"):
             query = normalize(attn.to_q(hidden_states).view(batch_size, seq_len, attn.heads, attn.dim_head), attn.norm_q)
             key = normalize(attn.to_k(hidden_states).view(batch_size, seq_len, attn.heads, attn.dim_head), attn.norm_k)
             value = attn.to_v(hidden_states).view(batch_size, seq_len, attn.heads, attn.dim_head)
         else:
-            qkv = (int8_backend.linear_with_fusion(attn.to_qkv, hidden_states, input_act="rms_norm", act_weight=pre_norm.weight, act_eps=pre_norm.eps)
+            qkv = (kernels.linear(attn.to_qkv, [hidden_states], input_act="rms_norm", act_weight=pre_norm.weight, act_eps=pre_norm.eps)
                    if pre_norm is not None else attn.to_qkv(hidden_states))
             qkv = qkv.view(batch_size, seq_len, attn.heads, 3, attn.dim_head)
-            query, key, value = qkv.unbind(dim=3)
+            query, key, value = qkv.unbind(dim=3)  # strided views of the head-interleaved projection: no copy
             query = normalize(query, attn.norm_q)
             key = normalize(key, attn.norm_k)
-            value = value.clone()
             del qkv
-        if kitchen_rms:
-            query, key = vae_kitchen.rms_rope(query, key, rotary_emb, attn.norm_q.eps)
+        query, key = vae_ops.finish_rope_(query, key, rotary_emb, attn.norm_q.eps, plan)
         residual = hidden_states if pre_norm is not None else None
         del hidden_states
-
-        if not fused and not kitchen_rms and rotary_emb is not None:
-            cos, sin = rotary_emb
-            cos, sin = cos.to(query.dtype), sin.to(query.dtype)
-            rotary_dim = cos.shape[-1]
-            query_rotary = query[..., :rotary_dim]
-            key_rotary = key[..., :rotary_dim]
-            query_first, query_second = query_rotary.chunk(2, dim=-1)
-            key_first, key_second = key_rotary.chunk(2, dim=-1)
-            half = query_first.shape[-1]
-            query_first_out = query_first * cos[..., :half] - query_second * sin[..., :half]
-            query_second_out = query_second * cos[..., half:] + query_first * sin[..., half:]
-            key_first_out = key_first * cos[..., :half] - key_second * sin[..., :half]
-            key_second_out = key_second * cos[..., half:] + key_first * sin[..., half:]
-            query_first.copy_(query_first_out)
-            query_second.copy_(query_second_out)
-            key_first.copy_(key_first_out)
-            key_second.copy_(key_second_out)
-            del query_first_out, query_second_out, key_first_out, key_second_out
 
         output_dtype = query.dtype
         if output_dtype == torch.float32:
             query, key, value = query.half(), key.half(), value.half()
-        hidden_states = pay_attention([query, key, value], causal=False, recycle_q=True)
+        # a strided query (view of the fused projection) gets a new contiguous output, which the output projection reads without a copy;
+        # handed off, the projection is released once quantized, before that output is allocated
+        qkv_list, recycle_q = [query, key, value], query.is_contiguous()
+        query = key = value = None
+        hidden_states = pay_attention(qkv_list, causal=False, recycle_q=recycle_q)
         projected = hidden_states.flatten(2, 3).to(output_dtype)
+        del hidden_states
         if residual is not None:
-            return int8_backend.linear_with_fusion(attn.to_out, projected, residual=residual, residual_scale=residual_scale)
+            projected_list, projected = [projected], None
+            return kernels.linear(attn.to_out, projected_list, residual=residual, residual_scale=residual_scale)
         return attn.to_out(projected)
 
 
@@ -483,33 +436,24 @@ class MiniMaxH3VideoFeedForward(nn.Module):
         hidden_states = _take(hidden_states)
         expanded = self.w1(hidden_states)
         del hidden_states
-        if _use_triton_vae(expanded):
-            gate = (vae_kernels.swiglu(expanded) if kernel_policy.allow_approximate()
-                    else vae_kernels.swiglu_(expanded))
-        else:
-            gate, value = expanded.chunk(2, dim=-1)
-            F.silu(gate, inplace=True).mul_(value)
-            del value
-        del expanded
+        x_list, expanded = [expanded], None
+        gate = vae_ops.swiglu(x_list)
         return self.w2(gate)
 
     def forward(self, hidden_states: list[torch.Tensor], pre_norm=None, residual_scale=None) -> torch.Tensor:
         hidden_states = _take(hidden_states)
-        chunk_size = max(1, hidden_states.shape[1] * hidden_states.shape[2] // self.w1.out_features)
-        if pre_norm is not None:
-            for start in range(0, hidden_states.shape[1], chunk_size):
-                x = hidden_states[:, start:start + chunk_size]
-                expanded = int8_backend.linear_with_fusion(self.w1, x, input_act="rms_norm", act_weight=pre_norm.weight, act_eps=pre_norm.eps)
-                output = int8_backend.linear_with_fusion(self.w2, expanded, input_act="swiglu", residual=x, residual_scale=residual_scale)
-                x.copy_(output)
-                del expanded, output
-            return hidden_states
-        if hidden_states.shape[1] <= chunk_size:
-            return self._project([hidden_states])
-        for start in range(0, hidden_states.shape[1], chunk_size):
-            output = self._project([hidden_states[:, start : start + chunk_size]])
-            hidden_states[:, start : start + output.shape[1]].copy_(output)
-            del output
+        # chunks of whole rows of the flattened tokens (contiguous: no input or residual copies, linears with their bias fused), each
+        # expanded projection about as large as the input; the output overwrites its own rows
+        rows = hidden_states.view(-1, hidden_states.shape[-1])
+        chunk_rows = max(1, rows.numel() // self.w1.out_features)
+        for start in range(0, rows.shape[0], chunk_rows):
+            x = rows[start:start + chunk_rows]
+            if pre_norm is None:
+                x.copy_(self._project([x]))
+                continue
+            expanded = kernels.linear(self.w1, [x], input_act="rms_norm", act_weight=pre_norm.weight, act_eps=pre_norm.eps)
+            expanded_list, expanded = [expanded], None
+            kernels.linear(self.w2, expanded_list, input_act="swiglu", residual=x, residual_scale=residual_scale, out=x)
         return hidden_states
 
 
@@ -536,26 +480,24 @@ class MiniMaxH3VideoTransformerBlock(nn.Module):
     ) -> torch.Tensor:
         hidden_states = _take(hidden_states)
         if (hasattr(self.attn, 'to_qkv')
-                and all(int8_backend.can_fuse_linear(layer, hidden_states, dtypes=_FUSED_DTYPES)
+                and all(kernels.can_linear(layer, hidden_states, dtypes=_FUSED_DTYPES)
                         for layer in (self.attn.to_qkv, self.attn.to_out, self.ff.w1, self.ff.w2))
                 and all(p.device == hidden_states.device and p.dtype == hidden_states.dtype
                         for p in (self.norm1.weight, self.norm2.weight, self.scale1, self.scale2))):
             hidden_states = self.attn([hidden_states], rotary_emb, pre_norm=self.norm1, residual_scale=self.scale1)
             return self.ff([hidden_states], pre_norm=self.norm2, residual_scale=self.scale2)
         norm_hidden_states = self.norm1(hidden_states.to(self.norm1.weight.dtype)).to(hidden_states.dtype)
-        branch = self.attn([norm_hidden_states], rotary_emb)
-        if _use_triton_vae(branch):
-            vae_kernels.residual_(branch, self.scale1, hidden_states)
-        else:
-            branch.mul_(self.scale1).add_(hidden_states)
+        normalized_list, norm_hidden_states = [norm_hidden_states], None
+        branch = self.attn(normalized_list, rotary_emb)
+        branch_list, branch = [branch], None
+        branch = vae_ops.scaled_residual(branch_list, self.scale1, hidden_states)
         del hidden_states
         hidden_states = branch
         norm_hidden_states = self.norm2(hidden_states.to(self.norm2.weight.dtype)).to(hidden_states.dtype)
-        branch = self.ff([norm_hidden_states])
-        if _use_triton_vae(branch):
-            vae_kernels.residual_(branch, self.scale2, hidden_states)
-        else:
-            branch.mul_(self.scale2).add_(hidden_states)
+        normalized_list, norm_hidden_states = [norm_hidden_states], None
+        branch = self.ff(normalized_list)
+        branch_list, branch = [branch], None
+        branch = vae_ops.scaled_residual(branch_list, self.scale2, hidden_states)
         del hidden_states
         return branch
 

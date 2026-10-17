@@ -13,6 +13,7 @@
 # limitations under the License.
 #
 # WanGP boundary adapter around the official MiniMax-H3 video VAE.
+# Modifications Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 
 import torch
 import torch.nn.functional as F
@@ -44,8 +45,8 @@ LATENTS_STD = (
 
 
 class MiniMaxH3VideoVAE(AutoencoderKLMiniMaxH3):
-    def __init__(self, upsampling=False):
-        super().__init__(out_channels=12 if upsampling else 3, latents_mean=LATENTS_MEAN, latents_std=LATENTS_STD)
+    def __init__(self, upsampling=False, decoder_num_layers=36):
+        super().__init__(out_channels=12 if upsampling else 3, decoder_num_layers=decoder_num_layers, latents_mean=LATENTS_MEAN, latents_std=LATENTS_STD)
         self.upsampling = upsampling
         self.register_buffer("_latents_mean", torch.tensor(LATENTS_MEAN, dtype=torch.float32, device="cpu"), persistent=upsampling)
         self.register_buffer("_latents_std", torch.tensor(LATENTS_STD, dtype=torch.float32, device="cpu"), persistent=upsampling)

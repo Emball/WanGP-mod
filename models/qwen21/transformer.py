@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# Modifications Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
@@ -19,14 +20,17 @@ from diffusers.models.normalization import RMSNorm
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.utils import logging
 from shared import attention_kit
+from shared.kernels import ops as kernels
 from shared.attention import pay_attention
 from shared.utils.phase_progress import check_abort
+from mmgp import cuda_graphs
 
 
 def dispatch_attention_fn(qkv_list, attn_mask=None, recycle_q=False):
     # The highest owning caller clears its Q/K/V names before this handoff.
     return pay_attention(qkv_list, attention_mask=None if attn_mask is None else attn_mask.transpose(1, 2), recycle_q=recycle_q)
 
+import dataclasses
 import math
 from typing import Any
 import torch
@@ -35,11 +39,10 @@ import torch.nn.functional as F
 logger = logging.get_logger(__name__)
 _IMG_TOKENS_PER_SLOT = 4
 _FLEX_BLOCK_SIZE = 128
-class QwenImage21KVLayerCache:
-
-    def __init__(self):
-        self.k: torch.Tensor | None = None
-        self.v: torch.Tensor | None = None
+@dataclasses.dataclass
+class QwenImage21KVLayerCache:  # a dataclass: CUDA graphs take its tensors as arguments
+    k: torch.Tensor | None = None
+    v: torch.Tensor | None = None
 
     def store(self, k: torch.Tensor, v: torch.Tensor):
         self.k = k
@@ -127,8 +130,8 @@ class QwenImage21ZeroCenterRMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        input_dtype = hidden_states.dtype
-        return F.rms_norm(hidden_states.float(), (hidden_states.shape[-1],), self.weight.float() + 1, self.eps).to(input_dtype)
+        x_list, hidden_states = [hidden_states], None
+        return kernels.zero_center_rms_norm(x_list, self.weight, self.eps)
 
 class QwenImage21TextProjection(nn.Module):
 
@@ -162,8 +165,8 @@ class QwenImage21SwiGLUFeedForward(nn.Module):
             check_abort()
             part = hidden_states[:, start:start + chunk]
             gate = self.gate_layer(part)
-            gate = F.silu(gate, inplace=True)
-            gate.mul_(self.proj(part))
+            activations, gate = [gate, self.proj(part)], None
+            gate = kernels.swiglu(activations, packed=False)
             # Input is a disposable normalized activation, not the residual.
             part.copy_(self.out(gate))
             del gate, part
@@ -188,19 +191,19 @@ def _apply_modulation_(hidden_states, scale, target_start):
     # Prefix tokens always precede the target. Broadcast one modulation row
     # over each region instead of allocating [B, tokens, hidden] via where.
     if target_start is None:
-        hidden_states.mul_(scale.unsqueeze(1) + 1)
+        kernels.scale_shift([hidden_states], scale.unsqueeze(1))
     else:
-        hidden_states[:, :target_start].mul_(scale[-1:].unsqueeze(1) + 1)
-        hidden_states[:, target_start:].mul_(scale[:-1].unsqueeze(1) + 1)
+        kernels.scale_shift([hidden_states[:, :target_start]], scale[-1:].unsqueeze(1))
+        kernels.scale_shift([hidden_states[:, target_start:]], scale[:-1].unsqueeze(1))
     return hidden_states
 
 
 def _add_gated_residual_(hidden_states, output, gate, target_start):
     if target_start is None:
-        hidden_states.add_(output.mul_(gate.unsqueeze(1).tanh()))
+        kernels.gated_residual_(hidden_states, [output], gate.unsqueeze(1), tanh=True)
     else:
-        hidden_states[:, :target_start].add_(output[:, :target_start].mul_(gate[-1:].unsqueeze(1).tanh()))
-        hidden_states[:, target_start:].add_(output[:, target_start:].mul_(gate[:-1].unsqueeze(1).tanh()))
+        kernels.gated_residual_(hidden_states[:, :target_start], [output[:, :target_start]], gate[-1:].unsqueeze(1), tanh=True)
+        kernels.gated_residual_(hidden_states[:, target_start:], [output[:, target_start:]], gate[:-1].unsqueeze(1), tanh=True)
 
 def _select_modulation_rows(params: torch.Tensor, target_token_mask: torch.Tensor | None) -> torch.Tensor:
     if target_token_mask is None:
@@ -272,12 +275,8 @@ def _qwenimage21_norm_rope_(query, key, attn, rotary_emb):
 
 
 def _qwenimage21_norm_rope_rows(x, norm, freqs_cis):
-    x = norm(x).to(x.dtype)
-    if freqs_cis is None:
-        return x
-    rotated = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
-    rotated.mul_(freqs_cis.unsqueeze(1))
-    return torch.view_as_real(rotated).flatten(3)
+    x_list, x = [x], None
+    return kernels.complex_norm_rope(x_list, norm, freqs_cis)
 
 
 def _qwenimage21_kit_attention(attn, hidden_states, rotary_emb, layer_cache, kv_cache_mode, segments):
@@ -569,25 +568,27 @@ class QwenImage21Transformer2DModel(ModelMixin, ConfigMixin):
                     negative_state['key_valid'] = negative_state['key_valid'][:, :prefix]
             inputs = [positive]
         prepared = [self._prepare(**item) for item in inputs]
-        for index, block in enumerate(self.transformer_blocks):
-            if negative_state is not None:
-                check_abort()
-                negative_args = {key: value for key, value in negative_state.items() if key != 'kv_cache'}
-                negative_args['layer_cache'] = negative_cache.get_layer(index)
-                negative_state['hidden_states'] = block(**negative_args)
-                del negative_args
-            for state, temb in prepared:
-                check_abort()
-                cache = state['kv_cache']
-                block_args = {key: value for key, value in state.items() if key != 'kv_cache'}
-                block_args['layer_cache'] = cache.get_layer(index) if cache is not None else None
-                if negative_cache is not None:
-                    block_args.update(nag_cache=negative_cache.get_layer(index), nag_parameters=nag_parameters, nag_target_tokens=math.prod(inputs[0]['img_shapes'][0][-1]))
-                state['hidden_states'] = block(**block_args)
-                del block_args
-            if temporary_negative_cache:
-                negative_cache.get_layer(index).k = None
-                negative_cache.get_layer(index).v = None
+        # the blocks that store K/V in a cache run eagerly: a capture would store tensors of its own memory
+        with cuda_graphs.scope(negative_state is None and all(item['kv_cache_mode'] != 'extract' for item in inputs)):
+            for index, block in enumerate(self.transformer_blocks):
+                if negative_state is not None:
+                    check_abort()
+                    negative_args = {key: value for key, value in negative_state.items() if key != 'kv_cache'}
+                    negative_args['layer_cache'] = negative_cache.get_layer(index)
+                    negative_state['hidden_states'] = block(**negative_args)
+                    del negative_args
+                for state, temb in prepared:
+                    check_abort()
+                    cache = state['kv_cache']
+                    block_args = {key: value for key, value in state.items() if key != 'kv_cache'}
+                    block_args['layer_cache'] = cache.get_layer(index) if cache is not None else None
+                    if negative_cache is not None:
+                        block_args.update(nag_cache=negative_cache.get_layer(index), nag_parameters=nag_parameters, nag_target_tokens=math.prod(inputs[0]['img_shapes'][0][-1]))
+                    state['hidden_states'] = block(**block_args)
+                    del block_args
+                if temporary_negative_cache:
+                    negative_cache.get_layer(index).k = None
+                    negative_cache.get_layer(index).v = None
         outputs = []
         for state, temb in prepared:
             # Drop state ownership before the disposable normalization call.

@@ -1,4 +1,6 @@
+# Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 import ast
+import functools
 import os
 import re
 import struct
@@ -9,12 +11,14 @@ from enum import IntEnum
 from typing import List, Optional
 
 import torch
+from torch._subclasses.fake_tensor import is_fake
 from torch.utils import _pytree as pytree
 
 from optimum.quanto import QModuleMixin, register_qmodule
 from optimum.quanto.tensor.qtensor import QTensor
 from optimum.quanto.tensor.qtype import qtype as _quanto_qtype, qtypes as _quanto_qtypes
 from collections import OrderedDict
+from mmgp import cuda_graphs as _cuda_graphs
 from mmgp.offload import QEmbedding as BaseQEmbedding
 
 
@@ -205,7 +209,7 @@ def _probe_gguf_cuda_runtime(force=False):
     except Exception as exc:
         _GGUF_CUDA_KERNELS_ENABLED_CACHE = False
         _GGUF_CUDA_MODULE = None
-        _GGUF_CUDA_LOAD_ERROR = exc
+        _GGUF_CUDA_LOAD_ERROR = f"{type(exc).__name__}: {exc}"  # not the exception: its traceback would keep the callers' frames (the models being loaded) alive
         _gguf_log_once("gguf_cuda_probe_failed", f"[GGUF][llama.cpp CUDA] kernels unavailable, using fallback")
         return False
     _GGUF_CUDA_KERNELS_ENABLED_CACHE = True
@@ -841,6 +845,37 @@ def _gguf_qtype_name(qtype_obj):
     return getattr(qtype_obj, "name", None) or str(qtype_obj)
 
 
+_LLAMACPP_SLICE_BYTES = 64 << 20  # scratch of the packed kernels for one slice of rows: q8_1 input and FP32 product
+GGUF_CUDA_CHUNKING = False  # Set True to opt into the new native CUDA row loop.
+
+# Switching implementations must select a fresh graph instead of replaying the old one.
+_cuda_graphs.register_key(lambda: GGUF_CUDA_CHUNKING)
+
+
+def _llamacpp_cuda_linear(module, raw, qtype_name, shape, input_tensor, bias, target_dtype):
+    # Legacy MMQ needs a Q8 input copy and an FP32 product. Bound that scratch with
+    # 128-row-aligned slices; newer kernels can process the same slices in one GPU loop.
+    out_features, in_features = shape
+    rows = input_tensor.numel() // in_features
+    step = max(128, _LLAMACPP_SLICE_BYTES // (4 * out_features + in_features * 9 // 8) // 128 * 128)
+    if rows < 2 * step or module._linear_mode() != "mmq":
+        return module.linear(raw, qtype_name, shape, input_tensor, bias, target_dtype)
+    step = -(-rows // (-(-rows // step) * 128)) * 128  # slices of even size
+    native_chunked = getattr(module, "linear_chunked", None) if GGUF_CUDA_CHUNKING else None
+    if callable(native_chunked):
+        out = native_chunked(raw, qtype_name, shape, input_tensor, bias, target_dtype, step)
+        if out is not None:
+            return out
+    # Older wheels and layouts outside the cooperative kernel keep bounded PyTorch slices.
+    x = input_tensor.reshape(rows, in_features)
+    out = torch.empty((rows, out_features), dtype=target_dtype, device=x.device)
+    for start in range(0, rows, step):
+        out[start:start + step].copy_(module.linear(raw, qtype_name, shape, x[start:start + step], None, torch.float32))
+    if bias is not None:
+        out.add_(bias.to(out.device, out.dtype))
+    return out.reshape(*input_tensor.shape[:-1], out_features)
+
+
 def _try_llamacpp_cuda_linear(weight_tensor, input_tensor, bias, target_dtype):
     if not _gguf_cuda_kernels_enabled():
         return None
@@ -850,17 +885,21 @@ def _try_llamacpp_cuda_linear(weight_tensor, input_tensor, bias, target_dtype):
     if not torch.is_tensor(raw) or raw.device.type != "cuda" or not raw.is_contiguous():
         return None
     qtype_name = _gguf_qtype_name(getattr(weight_tensor, "_tensor_type", None))
-    try:
-        gguf_llamacpp_cuda = _gguf_cuda_module()
-        if gguf_llamacpp_cuda is None or not gguf_llamacpp_cuda.may_support_linear_qtype_name(qtype_name):
-            return None
-        fast_out = gguf_llamacpp_cuda.linear(raw, qtype_name, tuple(getattr(weight_tensor, "_tensor_shape", weight_tensor.shape)), input_tensor, bias, target_dtype)
-        if fast_out is not None:
-            _gguf_log_once(f"llamacpp_cuda_linear_active_{qtype_name}", f"[GGUF][llama.cpp CUDA] linear fast path active for {qtype_name}.")
-        return fast_out
-    except Exception as exc:
-        _gguf_log_once(f"llamacpp_cuda_linear_{qtype_name}", f"[GGUF][llama.cpp CUDA] linear GGUF CUDA kernels failed for {qtype_name}, using fallback: {exc}")
+    gguf_llamacpp_cuda = _gguf_cuda_module()
+    if gguf_llamacpp_cuda is None or not gguf_llamacpp_cuda.may_support_linear_qtype_name(qtype_name):
         return None
+    shape = tuple(getattr(weight_tensor, "_tensor_shape", weight_tensor.shape))
+    # Restored orig_shape rows can cross GGUF blocks. MMQ requires whole blocks
+    # per row; the fused tile decoder addresses the original flattened stream.
+    if shape[1] % _quantization_sizes(weight_tensor._tensor_type)[0] and gguf_llamacpp_cuda._linear_mode() == "mmq":
+        select_kernel = getattr(gguf_llamacpp_cuda, 'packed_row_kernel', None)
+        flat_linear = None if select_kernel is None else select_kernel(qtype_name, input_tensor.device.index, target_dtype)
+        if flat_linear is None:
+            return None
+        return flat_linear(input_tensor, raw, list(shape), qtype_name, _maybe_cast_bias(bias, target_dtype), target_dtype)
+    fast_out = _llamacpp_cuda_linear(gguf_llamacpp_cuda, raw, qtype_name, shape, input_tensor, bias, target_dtype)
+    _gguf_log_once(f"llamacpp_cuda_linear_active_{qtype_name}", f"[GGUF][llama.cpp CUDA] linear fast path active for {qtype_name}.")
+    return fast_out
 
 
 def _try_llamacpp_cuda_embedding(weight_tensor, index_tensor, target_dtype):
@@ -872,17 +911,12 @@ def _try_llamacpp_cuda_embedding(weight_tensor, index_tensor, target_dtype):
     if not torch.is_tensor(raw) or raw.device.type != "cuda" or not raw.is_contiguous():
         return None
     qtype_name = _gguf_qtype_name(getattr(weight_tensor, "_tensor_type", None))
-    try:
-        gguf_llamacpp_cuda = _gguf_cuda_module()
-        if gguf_llamacpp_cuda is None or not gguf_llamacpp_cuda.may_support_embedding_qtype_name(qtype_name):
-            return None
-        fast_out = gguf_llamacpp_cuda.embedding(raw, qtype_name, tuple(getattr(weight_tensor, "_tensor_shape", weight_tensor.shape)), index_tensor, target_dtype)
-        if fast_out is not None:
-            _gguf_log_once(f"llamacpp_cuda_embedding_active_{qtype_name}", f"[GGUF][llama.cpp CUDA] embedding fast path active for {qtype_name}.")
-        return fast_out
-    except Exception as exc:
-        _gguf_log_once(f"llamacpp_cuda_embedding_{qtype_name}", f"[GGUF][llama.cpp CUDA] embedding GGUF CUDA kernels failed for {qtype_name}, using fallback: {exc}")
+    gguf_llamacpp_cuda = _gguf_cuda_module()
+    if gguf_llamacpp_cuda is None or not gguf_llamacpp_cuda.may_support_embedding_qtype_name(qtype_name):
         return None
+    fast_out = gguf_llamacpp_cuda.embedding(raw, qtype_name, tuple(getattr(weight_tensor, "_tensor_shape", weight_tensor.shape)), index_tensor, target_dtype)
+    _gguf_log_once(f"llamacpp_cuda_embedding_active_{qtype_name}", f"[GGUF][llama.cpp CUDA] embedding fast path active for {qtype_name}.")
+    return fast_out
 
 
 def _may_try_llamacpp_cuda_linear(weight_tensor, input_tensor):
@@ -1598,6 +1632,40 @@ class GGUFWeightTensor(QTensor):
         return _gguf_qfallback(op, *args, **(kwargs or {}))
 
 
+class _GGUFRowProjection:
+    @staticmethod
+    def supports(module, x):
+        weight = getattr(module, "weight", None)
+        return (isinstance(weight, GGUFWeightTensor) and not is_fake(x) and len(weight._tensor_shape) == 2
+                and weight.shape[1] % _quantization_sizes(weight._tensor_type)[0] == 0
+                and not (getattr(module, "_use_optimized_kernels", False) and x.shape[0] <= 8)
+                and not (getattr(module, "_prism_decode_enabled", False) and x.shape[0] == 1))
+
+    @staticmethod
+    def key(module):
+        transform = getattr(module, "prism_transform", None)
+        return ("prism_rows", transform) if transform is not None else None
+
+    @staticmethod
+    def prepare(module, x):
+        return module.prism_transform(x)
+
+    @staticmethod
+    def rows(module, x, start, stop):
+        source = module.weight
+        k = source.shape[1]
+        raw = source._data.reshape(source.shape[0], -1)[start:stop].reshape(-1)
+        weight = GGUFWeightTensor.create(raw, (stop - start, k), (k, 1), source.dtype,
+                                         tensor_type=source._tensor_type, tensor_shape=(stop - start, k))
+        return weight.linear(x, None if module.bias is None else module.bias[start:stop])
+
+
+from mmgp import offload
+
+_GGUF_ROW_PROJECTION = _GGUFRowProjection()
+offload.register_row_projection(_GGUF_ROW_PROJECTION)
+
+
 class GGUFFirstRowsLinear(torch.nn.Module):
     """Zero-copy linear view over a contiguous prefix of GGUF weight rows."""
 
@@ -1710,7 +1778,8 @@ class QLinearGGUF(QModuleMixin, torch.nn.Linear):
         if optimized and input.numel() <= 8 * input.shape[-1] and input.is_cuda and torch.version.hip is None and isinstance(qweight, GGUFWeightTensor):
             native = _gguf_cuda_module()
             supports = getattr(native, "supports_linear_fusions", None)
-            if callable(supports) and supports(qweight._tensor_type.name, input.numel() // input.shape[-1], input.device.index):
+            if (callable(supports) and qweight.shape[1] % _quantization_sizes(qweight._tensor_type)[0] == 0
+                    and supports(qweight._tensor_type.name, input.numel() // input.shape[-1], input.device.index)):
                 dtype = _resolve_default_dtype(qweight._gguf_default_dtype, fallback=input.dtype)
                 return linear_fused(input, qweight._data, qweight._tensor_type.name, list(qweight._tensor_shape), self.bias, dtype, silu_mul)
         if silu_mul:
@@ -2096,7 +2165,21 @@ def convert_to_quanto(state_dict, default_dtype, verboseLevel=1, detection=None)
     return {"state_dict": state_dict, "quant_map": quant_map}
 
 
+def _prepare_runtime_buffers(device):
+    module = _gguf_cuda_module()
+    if module is not None:
+        module.prepare_runtime_buffers(device)
+
+
+def _release_runtime_buffers():
+    if _GGUF_CUDA_MODULE is not None:
+        _GGUF_CUDA_MODULE.release_runtime_buffers()
+
+
 def apply_pre_quantization(model, state_dict, quantization_map, default_dtype=None, verboseLevel=1):
+    if model is not None and any(info.get("weights") == _GGUF_QTYPE_NAME for info in (quantization_map or {}).values()):
+        from mmgp import runtime
+        runtime.register_resource(model, _prepare_runtime_buffers, _release_runtime_buffers)
     if default_dtype is None or model is None or not quantization_map:
         return quantization_map or {}, []
     _set_default_dtype_from_loader(default_dtype)

@@ -1,3 +1,6 @@
+# Adapted from FLUX (https://github.com/black-forest-labs/flux), Copyright (c) Black Forest Labs,
+# Apache License 2.0 (see docs/third_party_licenses/Apache-2.0.txt). Modified for WanGP.
+# Modifications Copyright (c) 2025-2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 import math
 from dataclasses import dataclass
 
@@ -7,6 +10,7 @@ from torch import Tensor, nn
 
 from shared import attention_kit
 from ..math import apply_rope_, attention, rope
+from shared.kernels import ops
 
 def get_linear_split_map(
     hidden_size: int = 3072,
@@ -105,10 +109,8 @@ class RMSNorm(torch.nn.Module):
         self.scale = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: Tensor):
-        x_dtype = x.dtype
-        x = x.float()
-        rrms = torch.rsqrt(torch.mean(x**2, dim=-1, keepdim=True) + 1e-6)
-        return (x * rrms).to(dtype=x_dtype) * self.scale
+        x_list, x = [x], None
+        return ops.rms_norm_rounded(x_list, manual=True) * self.scale
 
 
 
@@ -202,8 +204,8 @@ class SiLUActivation(nn.Module):
         self.gate_fn = nn.SiLU()
 
     def forward(self, x: Tensor) -> Tensor:
-        x1, x2 = x.chunk(2, dim=-1)
-        return self.gate_fn(x1) * x2
+        x_list, x = [x], None
+        return ops.swiglu(x_list, in_place=False)
 
 
 class DoubleStreamBlock(nn.Module):
@@ -264,14 +266,10 @@ class DoubleStreamBlock(nn.Module):
             txt_mod1, txt_mod2 = self.txt_mod(vec)
 
         # prepare image for attention
-        img_modulated = self.img_norm1(img)
-        img_modulated.mul_(1 + img_mod1.scale)
-        img_modulated.add_(img_mod1.shift)
+        img_modulated = ops.norm_scale_shift([img], self.img_norm1, img_mod1.scale, img_mod1.shift)
 
         if NAG is None:
-            txt_modulated = self.txt_norm1(txt)
-            txt_modulated.mul_(1 + txt_mod1.scale)
-            txt_modulated.add_(txt_mod1.shift)
+            txt_modulated = ops.norm_scale_shift([txt], self.txt_norm1, txt_mod1.scale, txt_mod1.shift)
             txt_len, head_dim = txt.shape[1], self.hidden_size // self.num_heads
             streams = [([txt_modulated], (self.txt_attn.q, self.txt_attn.k, self.txt_attn.v)), ([img_modulated], (self.img_attn.q, self.img_attn.k, self.img_attn.v))]
             del txt_modulated, img_modulated
@@ -283,18 +281,19 @@ class DoubleStreamBlock(nn.Module):
         txt_attn, img_attn = attn[:, : txt.shape[1]], attn[:, txt.shape[1] :]
 
         # calculate the img blocks
-        torch.addcmul(img, self.img_attn.proj(img_attn), img_mod1.gate, out=img)
-        mod_img = self.img_norm2(img)
-        mod_img.mul_(1 + img_mod2.scale)
-        mod_img.add_(img_mod2.shift)
+        ops.gated_residual_(img, [self.img_attn.proj(img_attn)], img_mod1.gate, fused=True)
+        mod_img = ops.norm_scale_shift([img], self.img_norm2, img_mod2.scale, img_mod2.shift)
         mod_img = split_mlp(self.img_mlp, mod_img)
         # mod_img = self.img_mlp(mod_img)
-        torch.addcmul(img, mod_img, img_mod2.gate, out=img)
-        mod_img = None
+        mod_img_list, mod_img = [mod_img], None
+        ops.gated_residual_(img, mod_img_list, img_mod2.gate, fused=True)
 
         # calculate the txt blocks
-        torch.addcmul(txt, self.txt_attn.proj(txt_attn), txt_mod1.gate, out=txt)
-        torch.addcmul(txt, self.txt_mlp((1 + txt_mod2.scale) * self.txt_norm2(txt) + txt_mod2.shift), txt_mod2.gate, out=txt)
+        ops.gated_residual_(txt, [self.txt_attn.proj(txt_attn)], txt_mod1.gate, fused=True)
+        mod_txt = ops.norm_scale_shift([txt], self.txt_norm2, txt_mod2.scale, txt_mod2.shift, in_place=False)
+        mod_txt = self.txt_mlp(mod_txt)
+        mod_txt_list, mod_txt = [mod_txt], None
+        ops.gated_residual_(txt, mod_txt_list, txt_mod2.gate, fused=True)
         return img, txt
 
     def _attention_nag(self, img_list, txt, txt_mod1, pe, NAG):
@@ -310,9 +309,7 @@ class DoubleStreamBlock(nn.Module):
         img_k= self.img_attn.norm(None, img_k, img_v)
 
         # prepare txt for attention
-        txt_modulated = self.txt_norm1(txt)
-        txt_modulated.mul_(1 + txt_mod1.scale)
-        txt_modulated.add_(txt_mod1.shift)
+        txt_modulated = ops.norm_scale_shift([txt], self.txt_norm1, txt_mod1.scale, txt_mod1.shift)
 
         shape = (*txt_modulated.shape[:2], self.num_heads, int(txt_modulated.shape[-1] / self.num_heads) )
         txt_q = self.txt_attn.q(txt_modulated).view(*shape).transpose(1,2)
@@ -388,13 +385,8 @@ class SingleStreamBlock(nn.Module):
             mod = vec
         elif self.modulation is not None:
             mod, _ = self.modulation(vec)
-        x_mod = self.pre_norm(x)
-        x_mod.mul_(1 + mod.scale)
-        x_mod.add_(mod.shift)
+        x_mod = ops.norm_scale_shift([x], self.pre_norm, mod.scale, mod.shift)
 
-        ##### More spagheti VRAM optimizations done by DeepBeepMeep !
-        # I am sure you are a nice person and as you copy this code, you will give me proper credits:
-        # Please link to https://github.com/deepbeepmeep/Wan2GP and @deepbeepmeep on twitter  
 
         # x_mod = (1 + mod.scale) * x + mod.shift
 
@@ -430,8 +422,10 @@ class SingleStreamBlock(nn.Module):
             del attn_chunk, mlp_chunk 
             x_chunk[...] = self.linear2(attn_mlp_chunk)
             del attn_mlp_chunk
+        del x_chunks, x_chunk, attn_chunks, attn
         x_mod = x_mod.view(x_mod_shape)
-        torch.addcmul(x, x_mod, mod.gate, out=x)
+        x_mod_list, x_mod = [x_mod], None
+        ops.gated_residual_(x, x_mod_list, mod.gate, fused=True)
         return x
 
 
@@ -469,7 +463,8 @@ class LastLayer(nn.Module):
         else:
             shift, scale = self.adaLN_modulation(vec).chunk(2, dim=1)
         # x = (1 + scale[:, None, :]) * self.norm_final(x) + shift[:, None, :]
-        x = torch.addcmul(shift[:, None, :], 1 + scale[:, None, :], self.norm_final(x))
+        x_list, x = [x], None
+        x = ops.norm_scale_shift(x_list, self.norm_final, scale[:, None, :], shift[:, None, :], in_place=False, fused_add=True)
         x = self.linear(x)
         return x
 

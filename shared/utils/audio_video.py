@@ -1,3 +1,4 @@
+# Copyright (c) 2025-2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 import subprocess
 import tempfile, os
 import ffmpeg
@@ -70,7 +71,7 @@ def resample_audio_array(audio_data, source_sample_rate, target_sample_rate):
     return (resampled.T if audio_array.ndim == 2 else resampled[0]).astype(np.float32, copy=False)
 
 
-def append_sliding_window_audio(existing_audio_data, existing_audio_path, generated_audio, audio_sampling_rate, committed_audio_samples, existing_audio_sample_rate=None, prefix_start_samples=0, keep_existing=False, trim_ranges=(), video_fps=None):
+def append_sliding_window_audio(existing_audio_data, existing_audio_path, generated_audio, audio_sampling_rate, committed_audio_samples, existing_audio_sample_rate=None, prefix_start_samples=0, keep_existing=False, trim_ranges=(), video_fps=None, align_to_video=False, repair_samples=0):
     # keep_existing: a kept soundtrack also replaces the generated audio of the current window for as long as it lasts
     generated_audio = np.asarray(generated_audio, dtype=np.float32)
     if generated_audio.size == 0:
@@ -87,7 +88,13 @@ def append_sliding_window_audio(existing_audio_data, existing_audio_path, genera
     prefix_start_samples, committed_audio_samples = max(0, int(prefix_start_samples)), max(0, int(committed_audio_samples))
     prefix_audio = prefix_audio[prefix_start_samples:]
     prefix_audio = trim_audio_ranges(prefix_audio, trim_ranges, video_fps, audio_sampling_rate)
-    prefix_audio = prefix_audio[:committed_audio_samples + (generated_audio.shape[0] if keep_existing else 0)]
+    join_sample = committed_audio_samples - repair_samples
+    prefix_audio = prefix_audio[:join_sample + (generated_audio.shape[0] if keep_existing else 0)]
+    if align_to_video and not keep_existing and prefix_audio.shape[0] < join_sample:
+        if repair_samples:
+            raise ValueError("Audio overlap is too short to repair the previous window; increase the video overlap.")
+        # A deliberate cut has no overlap to regenerate: retain its timestamp with silence.
+        prefix_audio = np.pad(prefix_audio, [(0, join_sample - prefix_audio.shape[0])] + [(0, 0)] * (prefix_audio.ndim - 1))
     if prefix_audio.size == 0:
         return generated_audio
     if prefix_audio.ndim != generated_audio.ndim:
@@ -95,7 +102,16 @@ def append_sliding_window_audio(existing_audio_data, existing_audio_path, genera
         generated_audio = generated_audio[:, None] if generated_audio.ndim == 1 else generated_audio
     if prefix_audio.ndim == 2 and prefix_audio.shape[1] != generated_audio.shape[1]:
         prefix_audio = np.repeat(prefix_audio[:, :1], generated_audio.shape[1], axis=1) if prefix_audio.shape[1] == 1 else prefix_audio[:, :generated_audio.shape[1]]
-    return np.concatenate([prefix_audio, generated_audio[max(0, prefix_audio.shape[0] - committed_audio_samples):]], axis=0)
+    return np.concatenate([prefix_audio, generated_audio[max(0, prefix_audio.shape[0] - join_sample):]], axis=0)
+
+
+def audio_overlap_repair_seconds(overlap_frames, video_fps, repair_ms, overlap_audio=None, sample_rate=0):
+    overlap_seconds = overlap_frames / video_fps
+    shortfall = max(0.0, overlap_seconds - len(overlap_audio) / sample_rate) if overlap_audio is not None else 0.0
+    repair_seconds = repair_ms / 1000 + shortfall
+    if repair_seconds > overlap_seconds + 1e-9:
+        raise ValueError(f"Audio continuation needs more than {overlap_frames} overlap frames at {video_fps:g} FPS; increase the video overlap (repair requires {repair_seconds * 1000:.1f} ms).")
+    return min(repair_seconds, overlap_seconds)
 
 
 def create_silent_wav_file(output_dir=None, duration_seconds=0.0, sample_rate=16000, prefix="null_audio_"):
@@ -392,7 +408,7 @@ def _run_ffmpeg_encode(input_path, output_path, codec, bitrate=None, sample_rate
     if sample_rate:
         cmd += ["-ar", str(int(sample_rate))]
     cmd.append(output_path)
-    subprocess.run(cmd, check=True, capture_output=True, text=True)
+    subprocess.run(cmd, check=True, capture_output=True, text=True, encoding="utf-8", errors="replace")
 
 
 def save_audio_file(path, audio_data, sample_rate, codec_key="wav"):
@@ -551,7 +567,8 @@ def combine_and_concatenate_video_with_audio_tracks(
     new_audio_from_start=False,
     source_audio_metadata=None,
     audio_codec_key="aac_128",
-    verbose = False
+    verbose = False,
+    pad_audio_to_video=False,
 ):
     audio_codec = get_mp4_audio_codec_settings(audio_codec_key)["codec"]
     inputs, filters, maps, idx = ['-i', video_path], [], ['-map', '0:v'], 1
@@ -609,7 +626,8 @@ def combine_and_concatenate_video_with_audio_tracks(
                 filters.append(
                     f'[{idx}:a]aresample={audio_sampling_rate},aformat=channel_layouts={channel_layout},'
                     f'atrim=start={start},asetpts=PTS-STARTPTS[n{i}]')
-                filters.append(f'[s{i}][n{i}]concat=n=2:v=0:a=1[aout{i}]')
+                padding = ',apad=pad_dur=100' if pad_audio_to_video else ''
+                filters.append(f'[s{i}][n{i}]concat=n=2:v=0:a=1{padding}[aout{i}]')
                 idx += 1
             else:
                 filters.append(f'[s{i}]apad=pad_dur=100[aout{i}]')
@@ -627,14 +645,21 @@ def combine_and_concatenate_video_with_audio_tracks(
     if verbose:
         print(f"ffmpeg command: {cmd}")
     try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        subprocess.run(cmd, check=True, capture_output=True, text=True, encoding="utf-8", errors="replace")
     except subprocess.CalledProcessError as e:
         raise Exception(f"FFmpeg error: {e.stderr}")
 
 
+def subtitle_stream_count(path):
+    if get_virtual_media_entry(path) is not None:
+        return 0
+    return sum(stream['codec_type'] == 'subtitle' for stream in ffmpeg.probe(strip_virtual_media_suffix(path), cmd=_ffprobe_binary())['streams'])
+
+
 def combine_video_with_audio_tracks(target_video, audio_tracks, output_video,
-                                     audio_metadata=None, audio_codec_key="aac_128", verbose=False, video_duration=None):
-    if not audio_tracks:
+                                     audio_metadata=None, audio_codec_key="aac_128", verbose=False, video_duration=None, subtitle_source=None):
+    """Mux audio tracks, and the subtitle tracks of subtitle_source when given, with the video stream of target_video."""
+    if not audio_tracks and subtitle_source is None:
         if verbose: print("No audio tracks to combine."); return False
 
     if video_duration is None:
@@ -646,10 +671,24 @@ def combine_video_with_audio_tracks(target_video, audio_tracks, output_video,
     cmd = [_ffmpeg_binary(), '-y', '-i', target_video]
     for path in audio_tracks:
         cmd += ['-i', path]
+    if subtitle_source is not None:
+        source_path, time_args, _ = _resolve_virtual_audio_segment(subtitle_source)
+        for key, value in time_args.items():
+            cmd += [f'-{key}', str(value)]
+        cmd += ['-i', source_path]
+        if time_args:
+            # Seeking leaves subtitle packets before zero and across the chunk boundaries.
+            # Drop packets outside the chunk and clip overlapping cues before muxing.
+            subtitle_duration = min(float(dur), time_args['to'] - time_args['ss'])
+            cmd += ['-bsf:s', f"noise=amount=0:drop='lte(pts+duration,0)+gte(pts*tb,{subtitle_duration})',"
+                    f"setts=ts='max(TS,0)':duration='min(PTS+DURATION,{subtitle_duration}/TB)-max(PTS,0)'"]
 
     cmd += ['-map', '0:v']
     for i in range(len(audio_tracks)):
         cmd += ['-map', f'{i+1}:a']
+    if subtitle_source is not None:
+        # Text subtitles keep their language and title; MP4/MOV store them as mov_text, Matroska as SRT.
+        cmd += ['-map', f'{len(audio_tracks) + 1}:s', '-c:s', 'mov_text' if os.path.splitext(output_video)[1].lower() in ('.mp4', '.mov', '.m4v') else 'srt']
 
     for i, meta in enumerate(audio_metadata or []):
         if (lang := meta.get('language')):
@@ -658,7 +697,7 @@ def combine_video_with_audio_tracks(target_video, audio_tracks, output_video,
     cmd += ['-c:v', 'copy', *get_video_audio_encode_args(audio_codec_key)]
     cmd += ['-t', str(dur), output_video]
 
-    result = subprocess.run(cmd, capture_output=not verbose, text=True)
+    result = subprocess.run(cmd, capture_output=not verbose, text=True, encoding="utf-8", errors="replace")
     if result.returncode != 0:
         raise Exception(f"FFmpeg error:\n{result.stderr}")
     if verbose:

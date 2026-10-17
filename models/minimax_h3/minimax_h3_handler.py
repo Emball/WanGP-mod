@@ -1,3 +1,4 @@
+# Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 """WanGP family handler for MiniMax H3."""
 
 import os
@@ -16,7 +17,7 @@ from .constants import (H3_AUDIO_REFINEMENT_SETTING, H3_CONTROL_LATENT_CONTINUAT
                         h3_grouped_masking_enabled)
 from .dialogue import H3_DIALOGUE_GENERATION, H3_DIALOGUE_MAX_TOTAL_SECONDS, H3_DIALOGUE_PROMPT_INFOS, load_dialogue_whisper
 from .minimax_h3_main import (AUDIO_VAE_FILE, LATENT_UPSCALER_FILE, LATENT_UPSCALER_FOLDER, TEXT_ENCODER_FOLDER,
-                              VIDEO_VAE_FILE, VIDEO_VAE_FP8MIX_FILE, VIDEO_VAE_INT8_FILE)
+                              VIDEO_VAE_FILE, VIDEO_VAE_FP8MIX_FILE, VIDEO_VAE_INT8_FILE, VIDEO_VAE_LIGHT_FILE, VIDEO_VAE_LIGHT_INT8_FILE)
 from .pdd import PDD_BLOCK_SIZE, PDD_NUM_STEPS
 from .vae_upsampler import X2_VAE_DESCRIPTION, X2_VAE_FILE, X2_VAE_INT8_FILE, X2_VAE_METHOD, X2_VAE_VALUE, query_x2_vae_files
 from .viggle import VIGGLE_ARCHITECTURE, VIGGLE_ASSET_FOLDER, VIGGLE_INFOS, VIGGLE_PROMPT_FILE, VIGGLE_REPO_ID
@@ -63,7 +64,7 @@ FL2VA_DEEPY_INFOS = """Generate video and stereo sound from `prompt`. `image_sta
 
 Control Video (`video_guide`) is split across sliding windows, each window receiving its own section. `GV` (Denoise Control Video) edits its frames: lower Denoising Strength preserves more source content; Whole Frame at strength 1 gives full freedom. A mask selects the edited area. `VU` (In-Context Guide) supplies its unchanged frames as `<Video 1>` for LoRAs trained on FL2VA to transform a source video; name it `<Video 1>` in the prompt. Without such a LoRA, FL2VA is not trained to follow `VU`; for motion/appearance references, use Ref2VA Reference Video. Inject Frames uses ordered `image_refs` and explicit positions (`1` = first frame, `L` = last frame of the window, `X` = skip a window without consuming an image). A frame on a window's first or last frame acts as its start or end image; frames inside the overlap are unused. Per window, pictures are numbered: start or continued frame (`<Picture 1>`), end image, then that window's injected frames by time.
 
-`audio_prompt_type`: empty = generate video and audio; `A` = `audio_guide` is the soundtrack; `K` = the control video's audio track is the soundtrack (`GV` or `VU`); `2` = keep control frames and generate their audio (`GV`). The video follows a soundtrack and WanGP keeps it as the output audio when it covers the video; a shorter one permits generated sound afterward. For visible speech in soundtrack mode, identify the character and explicitly request `speaking with natural lip movements synchronized` or equivalent lip-sync wording, without mentioning a supplied audio track. No transcript is required; exact lip sync is not guaranteed.
+`audio_prompt_type`: empty = generate video and audio; `A` = `audio_guide` is the soundtrack; `K` = the control video's audio track is the soundtrack (`GV` or `VU`); `2` = keep control frames and generate their audio (`GV`). The video follows a soundtrack and WanGP keeps it as the output audio when it covers the video; a shorter one permits generated sound afterward. For visible speech in soundtrack mode, identify the character and explicitly request `speaking with natural lip movements synchronized` or equivalent lip-sync wording, without mentioning a supplied audio track or its language. Do not write the spoken words (no `<d>` dialogue): given a written line, H3 voices its own dialogue and the mouth often stops following the soundtrack. Keep the speaker's action to speaking: smiles, gestures and nods compete with the mouth. Exact lip sync is not guaranteed.
 
 Use `capabilities` for window limits. WanGP rounds overlap to compatible values (1, 18, 35, ...); `video_length` sets total duration across windows. Read `prompt_infos` for H3's structured prompt syntax.
 """
@@ -97,7 +98,7 @@ Both control video modes are split across sliding windows: each window receives 
 - **Generate Video based on Control Video + its Audio Track and Text Prompt (Soundtrack Kept):** select one of the control video modes. H3 uses both its frames and its existing audio track, which is kept as the soundtrack like an uploaded one; with **Denoise Control Video**, the visual changes follow the denoising and mask settings.
 - **Generate Audio based on Control Video and Text Prompt:** select **Denoise Control Video**. WanGP keeps the control video's frames unchanged and asks H3 to create a new soundtrack.
 
-For visible speech in soundtrack mode, identify the character and explicitly request synchronized speaking, for example `The woman is speaking with natural lip movements synchronized.` You do not need to write the spoken words or mention a supplied audio track. See the prompt guidance for examples; supplying speech alone does not guarantee visible speaking or exact lip sync.
+For visible speech in soundtrack mode, identify the character and explicitly request synchronized speaking, for example `The woman is speaking with natural lip movements synchronized.` Do not write the spoken words or mention the supplied audio track or its language: given a written line, the model voices its own dialogue and the mouth often stops following the soundtrack. Keep the action to speaking: smiles and gestures compete with the mouth. See the prompt guidance for examples; supplying speech alone does not guarantee visible speaking or exact lip sync.
 
 ### Longer videos
 
@@ -137,7 +138,7 @@ Ref2VA generates a new video with native 32 kHz stereo audio from text plus mult
 - **Generate Video based on Soundtrack and Text Prompt (Soundtrack Kept):** upload a speech or music track that must be heard exactly as it is. H3 creates the video around it and WanGP keeps the original audio in the final file, in sync across sliding windows.
 - **Generate Video based on Reference / Control Video + its Audio Track and Text Prompt (Soundtrack Kept):** the same, using the whole audio track of the reference video or of the control video. A reference video (or its excerpts) still guides appearance and motion; a control video (in-context or denoised) drives the generation in sync with its own audio. Requires a single reference video, excerpts from one, or a control video.
 
-A kept soundtrack is not a reference: do not mention a supplied audio track or assign it an `<Audio N>` label in the prompt. For visible speech, identify the character and include `speaking with natural lip movements synchronized` or equivalent lip-sync wording. No transcript is required; see the prompt guidance for examples.
+A kept soundtrack is not a reference: do not mention a supplied audio track or assign it an `<Audio N>` label in the prompt. For visible speech, identify the character and include `speaking with natural lip movements synchronized` or equivalent lip-sync wording. Do not write the spoken words (no `<d>` dialogue) or name the language, and keep the action to speaking; see the prompt guidance for examples.
 
 ### Excerpts from one Reference Video
 
@@ -227,7 +228,7 @@ A start image, an end image or a video to continue can be combined with the cont
 - **Generate Video based on Soundtrack and Text Prompt:** an uploaded soundtrack is kept and the video follows it.
 - **Generate Video based on Control Video + its Audio Track:** keep the control video's own soundtrack, for example the music of a dance video.
 
-A kept soundtrack stays in the saved output, but visible speech also depends on the prompt and the pose guide. Identify the character and explicitly request synchronized speaking, for example `The woman is speaking with natural lip movements synchronized.` You do not need to write the spoken words or mention a supplied audio track. A pose guide showing a still mouth or a lowered face can compete with speaking motion; keeping the soundtrack does not guarantee exact lip sync.
+A kept soundtrack stays in the saved output, but visible speech also depends on the prompt and the pose guide. Identify the character and explicitly request synchronized speaking, for example `The woman is speaking with natural lip movements synchronized.` Do not write the spoken words or mention the supplied audio track or its language: given a written line, the model voices its own dialogue and the mouth often stops following the soundtrack. Keep the action to speaking: smiles and gestures compete with the mouth. A pose guide showing a still mouth or a lowered face can compete with speaking motion; keeping the soundtrack does not guarantee exact lip sync.
 
 ### Recommended settings
 
@@ -236,7 +237,7 @@ The branch is guidance-distilled: keep **Guidance** at 1. Upstream demonstration
 See the [ControlNet-Union 2.0 model card](https://huggingface.co/alibaba-pai/MiniMax-H3-Fun-Controlnet-Union-2.0) for upstream details.
 """
 
-CONTROL_DEEPY_INFOS = f"""Generate video and stereo sound from `prompt` guided by a control video (`video_guide`) through the ControlNet-Union branch; the output uses the control video's aspect ratio. `video_prompt_type`: `PV` = Open Pose motion, `DV` = depth, `EV` = Canny edges, `SV` = soft shapes/scribble, `CV` = grayscale recolorize, `V` = video already a control map (HED, MLSD, layout...), `MV` = inpainting only. Add `A` (masked area) or `NA` (non-masked area) with `video_mask` to regenerate only part of the frame; masks need a preprocessing mode or `V` with spatial outpainting enabled. `control_net_weight` (0-2, default 1) sets control strength. Long control videos are split across sliding windows (max 362 frames each). {CONTROL_CONTINUATION_INFOS} `image_start` / `image_end` / `video_source` anchor frames and should match the control video. `audio_prompt_type`: empty = generate audio; `A` = keep `audio_guide` as soundtrack; `K` = keep the control video's soundtrack. For visible speech in soundtrack mode, identify the speaker and explicitly request `speaking with natural lip movements synchronized` or equivalent lip-sync wording, without mentioning a supplied audio track. No transcript is required; face pose can compete with speech, and exact lip sync is not guaranteed. Guidance stays 1. Read `prompt_infos` for H3's structured prompt syntax."""
+CONTROL_DEEPY_INFOS = f"""Generate video and stereo sound from `prompt` guided by a control video (`video_guide`) through the ControlNet-Union branch; the output uses the control video's aspect ratio. `video_prompt_type`: `PV` = Open Pose motion, `DV` = depth, `EV` = Canny edges, `SV` = soft shapes/scribble, `CV` = grayscale recolorize, `V` = video already a control map (HED, MLSD, layout...), `MV` = inpainting only. Add `A` (masked area) or `NA` (non-masked area) with `video_mask` to regenerate only part of the frame; masks need a preprocessing mode or `V` with spatial outpainting enabled. `control_net_weight` (0-2, default 1) sets control strength. Long control videos are split across sliding windows (max 362 frames each). {CONTROL_CONTINUATION_INFOS} `image_start` / `image_end` / `video_source` anchor frames and should match the control video. `audio_prompt_type`: empty = generate audio; `A` = keep `audio_guide` as soundtrack; `K` = keep the control video's soundtrack. For visible speech in soundtrack mode, identify the speaker and explicitly request `speaking with natural lip movements synchronized` or equivalent lip-sync wording, without mentioning a supplied audio track or its language. Do not write the spoken words (no `<d>` dialogue); face pose and gestures compete with speech, and exact lip sync is not guaranteed. Guidance stays 1. Read `prompt_infos` for H3's structured prompt syntax."""
 
 CONTROL_DEEPY_INFOS += """\n\nSpatial outpainting: use `video_prompt_type: V` (Use Control Video as is), the original RGB `video_guide`, and `video_guide_outpainting` as four space-separated percentages (top bottom left right), e.g. `0 0 25 25`. No `video_mask` is needed for borders alone. Alternatively, set `video_guide_outpainting_ratio`, e.g. `16:9`, with `video_guide_outpainting: 0 0 0 0` for balanced expansion; `#` disables expansion. `resolution` is the final canvas. Enabling expansion routes the visible source and automatic border mask through ControlNet inpainting, not FL2VA denoising; no Grouped Rows requirement. With expansion disabled, `V` retains its normal prepared-control-map behavior. For simultaneous interior edits, use `VA` or `MVA` plus `video_mask`; masked pose/depth/edge/shape/grayscale modes also support expansion. Describe the completed scene and new surroundings; the original rectangle is guided, not copied pixel for pixel."""
 
@@ -249,11 +250,11 @@ Enable **Advanced Mode**, open **General**, and choose an option under **Phases*
 - **Two Phases:** use it for faster high-resolution generation and improved fine detail. Most of the work is performed at a lower resolution before H3 enhances the result at the selected output resolution. This mode does not reduce the peak VRAM required by the final enhancement.
 - **Two Phases with Tiling:** use it when regular two-phase generation runs out of VRAM. It processes the final enhancement as four overlapping areas, reducing peak VRAM at the cost of extra processing time and a possible risk of visible seams or local inconsistencies.
 
-Start with the default **Phase 2 Noise Level Start**. Lower it to keep the result closer to the first phase and favor smoother tile blending; raise it to encourage stronger new details, with a greater risk of seams or changes between tiles.
+**Phase 2 Steps** controls the final enhancement independently of the first phase; the default is 3. Other counts use evenly spaced noise levels from **Phase 2 Noise Level Start** to zero. Start with the default noise level; lower it to keep the result closer to the first phase and favor smoother tile blending, or raise it to encourage stronger new details, with a greater risk of seams or changes between tiles. More steps are not necessarily better with a few-step accelerator.
 """
 
 H3_PHASE_TURBO_INFOS = """
-WanGP manages the required phase-two Turbo LoRA automatically. Other selected Turbo LoRAs are disabled during phase two to avoid conflicts, while non-Turbo LoRAs retain their selected phase-two multiplier.
+Phase 2 uses the automatic Turbo LoRA unless an accelerator before `|` in **LoRAs Multipliers** has a nonzero phase-2 multiplier. In that case, all selected accelerators keep their phase-2 multipliers and replace the automatic Turbo. For example, `1;0` keeps an accelerator in phase 1 only and uses the automatic Turbo in phase 2; `1;0.6` uses that accelerator at 0.6 in phase 2; `1` applies to both phases. Multiple accelerators and per-step multiplier sequences are supported. LoRAs after `|` retain their own multipliers.
 """
 
 H3_SPEED_INFOS = """
@@ -493,6 +494,7 @@ class family_handler:
     def query_model_def(base_model_type, model_def):
         if base_model_type == VIGGLE_ARCHITECTURE:
             result = family_handler.query_model_def(REF2VA_PRUNED_ARCHITECTURE, model_def)
+            result.pop("resolution_budget_tiled", None)
             result.update({
                 "profiles_dir": [VIGGLE_ARCHITECTURE],
                 "device_explicit": True,
@@ -509,7 +511,7 @@ class family_handler:
                 "extract_guide_from_window_start": True, "control_video_trim_disabled": False, "control_video_trim": False,
                 "image_prompt_types_allowed": "T", "end_frames_always_enabled": False, "image_end_frame_position": False,
                 "guidance_max_phases": 1, "lock_guidance_phases": True, "lora_multiplier_phases": 1,
-                "phase_2_spatial_tiling": False, "custom_settings": [], "sample_solvers": [("Euler", "euler")],
+                "phase_2_spatial_tiling": False, "inference_steps2": False, "custom_settings": [], "sample_solvers": [("Euler", "euler")],
                 "spectrum_cache": False, "first_block_cache": False,
                 "one_image_ref_needed": True, "no_background_removal": True, "any_image_refs_relative_size": False, "fit_into_canvas_image_refs": 1,
                 "image_ref_choices": {"choices": [("Use Edited Reference Frame", "I")], "letters_filter": "I", "default": "I", "label": "Edited Reference Frame"},
@@ -527,6 +529,7 @@ class family_handler:
         if base_model_type in CONTROL_ARCHITECTURES:
             pruned = base_model_type == CONTROL_PRUNED_ARCHITECTURE
             result = family_handler.query_model_def(FL2VA_PRUNED_ARCHITECTURE if pruned else FL2VA_ARCHITECTURE, model_def)
+            result.pop("resolution_budget_tiled", None)
             for key in ("guide_custom_choices", "custom_frames_injection", "one_image_ref_only", "switch_threshold"):
                 result.pop(key)
             result.update({
@@ -539,7 +542,7 @@ class family_handler:
                 "deepy_infos": CONTROL_DEEPY_INFOS,
                 "prompt_infos": FL2VA_PROMPT_INFOS, "deepy_prompt_infos": FL2VA_DEEPY_PROMPT_INFOS,
                 "v2i_switch_supported": False, "image_outputs": False,
-                "guidance_max_phases": 1, "lock_guidance_phases": True, "lora_multiplier_phases": 1, "phase_2_spatial_tiling": False,
+                "guidance_max_phases": 1, "lock_guidance_phases": True, "lora_multiplier_phases": 1, "phase_2_spatial_tiling": False, "inference_steps2": False,
                 "custom_settings": [setting for setting in result["custom_settings"] if setting["id"] == H3_AUDIO_REFINEMENT_SETTING],
                 "sliding_window_defaults": {**result["sliding_window_defaults"], "window_max": 362,
                                             **({"overlap_min": 5, "overlap_max": 107, "overlap_offset": 5, "overlap_default": 22} if H3_CONTROL_LATENT_CONTINUATION else {})},
@@ -560,15 +563,17 @@ class family_handler:
         pruned = base_model_type in (FL2VA_PRUNED_ARCHITECTURE, REF2VA_PRUNED_ARCHITECTURE)
         vdn = model_def.get("vdn", False)
         pdd = model_def.get("pdd", False)
+        veda = model_def.get("veda", False)
         text_encoder_variant = model_def.get("text_encoder_variant")
         text_encoder_files = [TEXT_ENCODER_BF16, TEXT_ENCODER_INT8] if text_encoder_variant is None else TEXT_ENCODER_VARIANTS[text_encoder_variant]
         result = {
             "dtype": "bf16",
             "device_explicit": True,
+            "cuda_graphs": [] if veda else ["transformer"],
             "uint8_guides": _uint8_guides,
             "tiny_vae_architecture": REF2VA_ARCHITECTURE,
             "size": "lighter" if pruned else "large",
-            **({"accelerated": "native"} if pdd or vdn else {}),
+            **({"accelerated": "native"} if pdd or vdn or veda else {}),
             **({"specialities": [{"name": "character consistency", "aliases": ["identity preservation"]}, {"name": "motion transfer", "description": "Transfer motion or camera from reference videos to image-reference characters."}]} if reference_mode else {}),
             "fps": 24,
             "v2i_switch_supported": True,
@@ -584,6 +589,8 @@ class family_handler:
             "visible_phases": 0,
             "lora_multiplier_phases": 1 if pdd else 2,
             "phase_2_spatial_tiling": not pdd,
+            "resolution_budget": "2048x2048",
+            **({"resolution_budget_tiled": "3840x2176"} if not pdd else {}),
             "custom_settings": [{
                 "id": H3_MASK_MODE_SETTING,
                 "name": "Mask Denoising Mode",
@@ -597,7 +604,7 @@ class family_handler:
                 "video_prompt_type": "G",
             }, {
                 "id": H3_AUDIO_REFINEMENT_SETTING,
-                "name": "Audio Refinement Extra Phase",
+                "name": "Audio Refinement",
                 "label": "Audio Refinement Extra Phase",
                 "type": "dropdown",
                 "default": "none",
@@ -621,6 +628,7 @@ class family_handler:
                 "step": 0.0001,
             },
             "inference_steps": True,
+            "inference_steps2": not pdd,
             "lock_inference_steps": pdd,
             "flow_shift": True,
             "spectrum_cache": True,
@@ -631,10 +639,12 @@ class family_handler:
             "custom_attention_modes": {
                 "vdn": {"label": "VDN hybrid attention", "supports_sparsity": False, "installed": True, "supported": True},
             } if vdn else {
+                "veda": {"label": "Veda Learned Sparse Attention (Triton, NVIDIA SM80+)", "supports_sparsity": False},
+            } if veda else {
                 "sol": {"label": "Sol sparse attention, requires Triton and RTX 30xx or newer", "supports_sparsity": True},
             },
-            "default_attention_modes_supported": not vdn,
-            "attention": {">=0": "vdn"} if vdn else None,
+            "default_attention_modes_supported": not (vdn or veda),
+            "attention": {">=0": "vdn"} if vdn else {">=80": "veda"} if veda else None,
             "attention_sparsity": {
                 "label": "Start Tau (higher = more sparse/faster; lower = more faithful; End Tau = 0.8)",
                 "start": 0.0,
@@ -644,6 +654,8 @@ class family_handler:
             "sample_solvers": [("Euler", "euler")] if pdd else [("Euler", "euler"), ("RES Multistep", "res_multistep"), ("Ralston 2S (~2x slower)", "ralston_2s")],
             "no_negative_prompt": True,
             "returns_audio": True,
+            "audio_window_alignment": True,
+            "audio_overlap_repair_ms": 25,  # one audio latent, plus the measured waveform shortfall
             "multimedia_generation": True,
             "image_end_frame_position": True,
             "control_video_trim_disabled": True,
@@ -696,6 +708,8 @@ class family_handler:
                 "bf16": {"name": "BF16", "video_vae_file": VIDEO_VAE_FILE, "x2_vae_file": X2_VAE_FILE},
                 "fp8mix": {"name": "FP8 Mixed Precision", "video_vae_file": VIDEO_VAE_FP8MIX_FILE, "x2_vae_file": X2_VAE_FILE},
                 "int8_convrot": {"name": "INT8 ConvRot Decoder", "video_vae_file": VIDEO_VAE_INT8_FILE, "x2_vae_file": X2_VAE_INT8_FILE},
+                "lightvae": {"name": "LightVAE Lite BF16", "video_vae_file": VIDEO_VAE_LIGHT_FILE, "x2_vae_file": X2_VAE_FILE},
+                "lightvae_int8": {"name": "LightVAE Lite INT8 ConvRot", "video_vae_file": VIDEO_VAE_LIGHT_INT8_FILE, "x2_vae_file": X2_VAE_INT8_FILE},
             },
             "system_configs3": {
                 "_name": "DiT Denoising Priority",
@@ -831,20 +845,31 @@ class family_handler:
             })
         if pdd:
             result["deepy_infos"] += " PDD requires exactly 8 inference steps and the Euler sampler."
+        else:
+            result["deepy_infos"] += " Two-phase generation uses `num_inference_steps2` (default 3) for final enhancement and `switch_threshold` for its starting noise. Accelerator LoRAs before `|` with any nonzero phase-2 multiplier replace the automatic Turbo together, at their specified multipliers; if all are zero, the automatic Turbo is used. `1;0` means phase 1 only, `1;0.6` sets phase 2 to 0.6, and `1` applies to both phases. LoRAs after `|` keep their multipliers."
         if vdn:
             result["deepy_infos"] += " VDN loads its acceleration LoRA automatically and defaults to 8 steps."
+        if veda:
+            result["compile"] = False
+            help_text = " Veda variants always use learned sparse attention in the H3 transformer; the attention override is locked to Veda. Other attention operations use the application attention backend. It reuses the standard H3 settings, LoRAs and step counts. The predictor follows Transformer Quantization (BF16 or INT8 ConvRot). Sparsity can change fine detail or motion; compare with a standard H3 variant at the same seed. Speed benefits are greatest for large videos. Requires Triton and an NVIDIA SM80+ GPU. Veda runs without CUDA graphs or transformer compilation."
+            result["infos"] += "\n\n### Veda Sparse Attention\n\n" + help_text.strip()
+            result["deepy_infos"] += help_text
         still_infos = "\n\n**Text to Image:** generate one still image without audio. Video duration, extra frames and Audio Refinement do not apply in this mode."
         still_prompt_infos = "\n\nFor Text to Image, describe one still scene: its subject, composition, lighting and details. A plain-language image prompt is sufficient; speech and soundtrack instructions are unnecessary. The optional Write enhancer offers image prompts from text alone or from text plus the selected images. With an image, specify what to change and what to preserve."
         result["infos"] += still_infos
         result["deepy_infos"] += still_infos + " Set `image_mode` to `1`."
         result["infos"] += "\n\n**MiniMax H3 VAE:** " + X2_VAE_DESCRIPTION
+        result["infos"] += "\n\n**LightVAE Lite:** the Video VAE selector offers a smaller 12-layer decoder in BF16 or INT8 ConvRot. Both keep the original H3 encoder for first/last frames and references. Decoded detail can differ from the full VAE. Selecting MiniMax H3 VAE upsampling replaces LightVAE with the X2 decoder."
         result["deepy_infos"] += " MiniMax H3 VAE replaces the default VAE and handles decoding and upsampling together. Choose `h3_vae*2` to double the output width and height, `h3_vae*1.5` to enlarge them by half, or `h3_vae*1` to keep the original size."
+        result["deepy_infos"] += " Video VAE configs `lightvae` and `lightvae_int8` select LightVAE's 12-layer decoder with the original H3 encoder; decoding may change detail. VAE upsampling overrides this choice with the X2 decoder."
         result["prompt_infos"] += still_prompt_infos
         result["deepy_prompt_infos"] += still_prompt_infos
         return result
 
     @staticmethod
     def validate_generative_settings(base_model_type, model_def, inputs):
+        if model_def.get("veda", False):
+            inputs["override_attention"] = "veda"
         if ((inputs.get("spatial_upsampling") or "").startswith(X2_VAE_METHOD) and int(inputs["image_mode"]) == 0
                 and base_model_type not in (REF2VA_ARCHITECTURE, REF2VA_PRUNED_ARCHITECTURE, VIGGLE_ARCHITECTURE)
                 and "2" in inputs["audio_prompt_type"]):
@@ -1069,9 +1094,9 @@ class family_handler:
         video_vae_file = model_def.get("video_vae_file", VIDEO_VAE_FILE)
         if video_vae_file in (VIDEO_VAE_FILE, VIDEO_VAE_FP8MIX_FILE):
             vae_files.append(video_vae_file)
-        if video_vae_file == VIDEO_VAE_INT8_FILE:
+        if video_vae_file in (VIDEO_VAE_INT8_FILE, VIDEO_VAE_LIGHT_FILE, VIDEO_VAE_LIGHT_INT8_FILE):
             source_folders.append("minimax_h3")
-            file_lists.append([VIDEO_VAE_INT8_FILE.rsplit("/", 1)[-1]])
+            file_lists.append([video_vae_file.rsplit("/", 1)[-1]])
         if "audio_vae_file" not in model_def:
             vae_files.append(AUDIO_VAE_FILE)
         if vae_files:
@@ -1098,9 +1123,9 @@ class family_handler:
         if base_model_type == VIGGLE_ARCHITECTURE:
             downloads.append({"repoId": VIGGLE_REPO_ID, "sourceFolderList": [VIGGLE_ASSET_FOLDER], "fileList": [[VIGGLE_PROMPT_FILE]]})
         if base_model_type == TTS_REF2VA_PRUNED_ARCHITECTURE and H3_DIALOGUE_GENERATION:
-            from shared.deepy.assets import query_deepy_download_defs
+            from shared.deepy.assets import whisper_download_def
 
-            downloads.extend(query_deepy_download_defs())
+            downloads.append(whisper_download_def())
         return downloads
 
     @staticmethod
@@ -1125,7 +1150,7 @@ class family_handler:
                                  video_vae_filename=video_vae_file,
                                  audio_vae_filename=model_def.get("audio_vae_file", AUDIO_VAE_FILE), shared_h3_pipeline=shared_h3_pipeline,
                                  pdd=pdd, pdd_num_steps=PDD_NUM_STEPS if pdd else None, pdd_block_size=PDD_BLOCK_SIZE if pdd else None,
-                                 vdn=model_def.get("vdn", False), audio_only=base_model_type == TTS_REF2VA_PRUNED_ARCHITECTURE,
+                                 vdn=model_def.get("vdn", False), veda=model_def.get("veda", False), audio_only=base_model_type == TTS_REF2VA_PRUNED_ARCHITECTURE,
                                  fixed_prompt_filename=os.path.join(VIGGLE_ASSET_FOLDER, VIGGLE_PROMPT_FILE) if viggle else None,
                                  clipproj_filename=model_def.get("clipproj_file"),
                                  tokenizer_folder=model_def.get("tokenizer_folder"))
@@ -1154,6 +1179,10 @@ class family_handler:
 
     @staticmethod
     def fix_settings(base_model_type, settings_version, model_def, ui_defaults):
+        if model_def.get("veda", False):
+            ui_defaults["override_attention"] = "veda"
+        elif ui_defaults.get("override_attention") == "veda":
+            ui_defaults["override_attention"] = ""
         if base_model_type == TTS_REF2VA_PRUNED_ARCHITECTURE:
             return
         if base_model_type in CONTROL_ARCHITECTURES:
@@ -1229,6 +1258,7 @@ class family_handler:
             "sliding_window_overlap": 18,
             "num_inference_steps": 20,
             "guidance_phases": 1,
+            "num_inference_steps2": 3,
             "switch_threshold": H3_PHASE_2_NOISE_LEVEL_START_DEFAULT,
             "guidance_scale": 1.0,
             "flow_shift": 12.0,

@@ -5,7 +5,7 @@ from typing import Callable, Tuple
 
 import numpy as np
 import torch
-from ....denoiser_kernels import split_rope
+from shared.kernels.ops import compact_rope_ as split_rope
 
 
 USE_FP32_ROPE_FREQS = False
@@ -351,7 +351,8 @@ def _apply_split_rope_layout_compile_safe(input_tensor: torch.Tensor, rope_cache
 def _build_layout_axis_token_indices(grid_sizes: tuple[int, ...], axis: int, device: torch.device) -> torch.Tensor:
     shape = [1] * len(grid_sizes)
     shape[axis] = grid_sizes[axis]
-    return torch.arange(grid_sizes[axis], dtype=torch.long, device=device).view(*shape).expand(*grid_sizes).reshape(-1)
+    # contiguous: with a single latent frame, reshape keeps the expanded view, whose shared elements CUDA graph buffers cannot hold
+    return torch.arange(grid_sizes[axis], dtype=torch.long, device=device).view(*shape).expand(*grid_sizes).reshape(-1).contiguous()
 
 
 def _apply_split_rope_layout_inplace(input_tensor: torch.Tensor, rope_cache: RopeCache, layout: RopeLayoutCache) -> None:
@@ -453,6 +454,40 @@ def apply_rope_cache_inplace(input_tensor: torch.Tensor, rope_cache: RopeCache) 
     apply_layout = _apply_split_rope_layout_inplace if rope_cache.rope_type == LTXRopeType.SPLIT else _apply_interleaved_rope_layout_inplace
     for layout in rope_cache.layouts:
         apply_layout(input_tensor[:, layout.token_start : layout.token_stop], rope_cache, layout)
+    return input_tensor
+
+
+def apply_rope_cache_heads_inplace(input_tensor: torch.Tensor, rope_cache: RopeCache, heads: range) -> torch.Tensor:
+    """Rotate a contiguous range of heads with the original cache's absolute frequency and padding positions."""
+    if len(heads) == rope_cache.num_attention_heads:
+        return apply_rope_cache_inplace(input_tensor, rope_cache)
+    dim_head = input_tensor.shape[-1] // len(heads)
+    half_dim, axis_count = dim_head // 2, len(rope_cache.axes)
+    work_dtype = torch.float32 if rope_cache.use_fp32_freqs else input_tensor.dtype
+    for layout in rope_cache.layouts:
+        rows = input_tensor[:, layout.token_start:layout.token_stop]
+        if split_rope(rows, rope_cache, layout, heads.start, dim_head):
+            continue
+        # Keep the native PyTorch rotation and its rounding on unsupported devices or with strict kernel precision.
+        view = rows.reshape(rows.shape[0], *layout.grid_sizes, len(heads), dim_head)
+        for axis_index, axis in enumerate(rope_cache.rope_axes):
+            cos_axis = layout.axis_cos[axis_index].to(device=rows.device, dtype=work_dtype)
+            sin_axis = layout.axis_sin[axis_index].to(device=rows.device, dtype=work_dtype)
+            for group in rope_cache.split_groups[axis_index]:
+                skip = max(0, (heads.start - group.head_start + axis_count - 1) // axis_count)
+                first = group.head_start + skip * axis_count
+                count = min(group.head_count - skip, (heads.stop - 1 - first) // axis_count + 1)
+                if count <= 0:
+                    continue
+                head_slice = slice(first - heads.start, first - heads.start + count * axis_count, axis_count)
+                x0 = view[..., head_slice, group.local_start:half_dim:axis_count]
+                x1 = view[..., head_slice, half_dim + group.local_start::axis_count]
+                cos = _split_group_freq_view(cos_axis, group, half_dim)[:, skip:skip + count]
+                sin = _split_group_freq_view(sin_axis, group, half_dim)[:, skip:skip + count]
+                buffers = _make_axis_buffers(x0, work_dtype)
+                _apply_axis_rotation(x0, x1, _broadcast_group_freqs(cos, axis, len(layout.grid_sizes)),
+                                     _broadcast_group_freqs(sin, axis, len(layout.grid_sizes)), work_dtype, buffers)
+                del buffers
     return input_tensor
 
 

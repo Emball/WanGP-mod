@@ -1,3 +1,4 @@
+# Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 
 import torch
 from PIL import Image
@@ -75,6 +76,7 @@ class family_handler:
         return {
             "image_outputs": True,
             "device_explicit": True,
+            "cuda_graphs": ["transformer"],
             "dtype": "bf16",
             "no_negative_prompt": True,
             "no_background_removal": True,
@@ -97,6 +99,8 @@ class family_handler:
             "infos": SENSENOVA_INFOS,
             "specialities": [{"name": "infographics", "aliases": ["information graphics", "information posters"]}, {"name": "text rendering", "description": "Chinese and English lettering within images."}, {"name": "precise layouts"}],
             "prompt_infos": SENSENOVA_PROMPT_INFOS,
+            "deepy_infos": "### SenseNova-U1.5\n\nText-to-image and editing with ordered references. First-reference main-scene mode derives dimensions from that image; ordinary-reference mode keeps chosen resolution. Start at 50 steps, guidance 4, shift 3, 2048px; the official 8-step profile is a separate accelerated choice. Strengths: infographics, Chinese/English text, layouts. Proofread text, counts and placement; complex edits can affect untouched content.",
+            "deepy_prompt_infos": '### Prompt\n\nDescribe subject, composition, style, palette and light. For infographics specify layout/panels, hierarchy and every exact string in quotes. For edits, state change and preservation constraints; number reference roles. Example: `Replace "CLOSED" with "OPEN", retaining the sign material and perspective.` Enhancement is optional; use it for short briefs needing design detail.',
             "preview_all_images": True,
             "prompt_enhancer_button_label": "Enhance",
             "prompt_enhancer_def": {
@@ -118,7 +122,7 @@ class family_handler:
             "text_prompt_enhancer_max_tokens1": 1536,
             "image_prompt_enhancer_max_tokens1": 1536,
             "profiles_dir": [_PROFILE_FOLDER],
-            "resolutions_categories": ["<=4096p"],
+            "resolution_budget": "4096x4096",
             "skip_prompt_template": True,
             "vae_block_size": 32,
         }
@@ -137,7 +141,7 @@ class family_handler:
 
     @staticmethod
     def query_family_infos():
-        return {"sensenova": (1160, "SenseNova")}
+        return {"sensenova": (1170, "SenseNova")}
 
     @staticmethod
     def get_lora_dir(base_model_type):
