@@ -16,7 +16,8 @@ For WanGP itself (features, supported models, usage) see the upstream README.
 | M4 | ClipProj models skip the automatic Hugging Face downloads |
 | M5 | Audio VAEs with fused weight-norm weights load correctly |
 | M6 | LoRAs with flat `final_layer_audio_out` / `final_layer_video_out` keys load correctly |
-| M7 | RefMods: inject precomputed reference latents (visual/audio, with strength) via a settings field |
+| M7 | RefMods: inject precomputed reference latents (visual/audio) with a per-entry weight; weights above 1 repeat the RefMod |
+| M8 | RefMods tab beside LoRAs: dropdown selectors with a weight slider per entry |
 
 Exact definitions, formats and code locations: [docs/MODS.md](docs/MODS.md).
 

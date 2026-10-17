@@ -5,10 +5,12 @@ from pathlib import Path
 H3_REFMODS_SETTING = "h3_refmods"
 
 ROOT = Path(__file__).resolve().parents[2]
-SEARCH_DIRS = (ROOT / "refmods", ROOT / "ckpts" / "refmods", ROOT / "loras" / "refmods", ROOT / "loras" / "minimax_h3" / "refmods", ROOT)
+SEARCH_DIRS = (ROOT / "refmods", ROOT / "ckpts" / "refmods", ROOT / "loras" / "refmods", ROOT / "loras" / "minimax_h3" / "refmods", ROOT / "loras" / "refmods_plugin" / "minimax_h3", ROOT)
 META_KEYS = ("refmod_meta", "audio_refmod_meta")
 VISUAL_KINDS = ("image", "video")
 PARTS = ("all", "visual", "audio")
+MAX_WEIGHT = 10.0
+RESERVED_NAME_CHARS = ",;#:\n"
 
 _TOKEN = re.compile(r"^(?P<name>.+?)(?:#(?P<part>visual|audio|all))?(?::(?P<strength>\d*\.?\d+))?$", re.IGNORECASE)
 
@@ -23,10 +25,20 @@ def parse_refmod_spec(text):
         if match is None:
             raise ValueError(f"RefMods: cannot read '{raw}'. Use name, name:0.8 or name#audio:0.8")
         strength = float(match.group("strength")) if match.group("strength") else 1.0
-        if not 0.0 <= strength <= 1.0:
-            raise ValueError(f"RefMods: strength for '{match.group('name')}' must be between 0 and 1")
+        if not 0.0 <= strength <= MAX_WEIGHT:
+            raise ValueError(f"RefMods: weight for '{match.group('name')}' must be between 0 and {MAX_WEIGHT:g}")
         entries.append((match.group("name").strip(), (match.group("part") or "all").lower(), strength))
     return entries
+
+
+def serialize_refmod_spec(entries):
+    parts = []
+    for name, part, weight in entries:
+        name = (name or "").strip()
+        if not name or any(char in name for char in RESERVED_NAME_CHARS):
+            continue
+        parts.append(name + (f"#{part}" if part in PARTS and part != "all" else "") + (f":{min(max(float(weight), 0.0), MAX_WEIGHT):g}" if float(weight) != 1.0 else ""))
+    return ", ".join(parts)
 
 
 def _available_files():
@@ -36,6 +48,20 @@ def _available_files():
             for path in folder.rglob("*.safetensors"):
                 seen.setdefault(str(path), path)
     return sorted(seen.values())
+
+
+def list_refmod_choices():
+    names = []
+    for folder in SEARCH_DIRS[:-1]:
+        if not folder.is_dir():
+            continue
+        for path in sorted(folder.rglob("*.safetensors")):
+            name = path.relative_to(folder).with_suffix("").as_posix()
+            if any(char in name for char in RESERVED_NAME_CHARS):
+                print(f"[RefMods] '{name}' is hidden from the selector: names cannot contain , ; # or :")
+            elif name not in names:
+                names.append(name)
+    return names
 
 
 def resolve_refmod_path(name):
@@ -146,7 +172,9 @@ def load_refmods(text, framework="pt"):
             _validate(latent, kind, label)
             if (part == "visual" and kind == "audio") or (part == "audio" and kind != "audio") or strength <= 0.0:
                 continue
-            mods.append({"name": meta.get("name") or path.stem, "kind": kind, "latent": _apply_strength(latent, strength), "strength": strength, "file": path.name})
+            whole = int(strength)
+            for level in [1.0] * whole + ([strength - whole] if strength - whole > 1e-6 else []):
+                mods.append({"name": meta.get("name") or path.stem, "kind": kind, "latent": _apply_strength(latent, level), "strength": level, "file": path.name})
     if mods:
         summary = ", ".join(f"{m['name']} ({m['kind']} {'x'.join(str(n) for n in m['latent'].shape[2:])}, {m['strength']:g})" for m in mods)
         print(f"[RefMods] loaded {len(mods)}: {summary}")

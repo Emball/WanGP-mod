@@ -13,7 +13,8 @@ Version: `VERSION`.
 All behavioural changes live in `models/minimax_h3/`:
 `minimax_h3_main.py` (loaders), `minimax_h3_handler.py` (model-def keys, UI settings, downloads),
 `text_encoder.py` (ClipProj), `pipeline.py` (RefMods injection), `transformer.py` (LoRA keys),
-`refmods.py` and `qwen3_vl_4b_config.json` (new).
+`refmods.py`, `refmods_ui.py` and `qwen3_vl_4b_config.json` (new).
+Outside the package, `wgp.py` carries the M8 hook only: `custom_setting_visible(..., ignore_hidden)` and the loop that calls `build_refmods_tab` after the LoRAs tab.
 Also fork-owned: `README.md`, `AGENTS.md`, `VERSION`, `docs/MODS.md`, `tools/`, `examples/`, `scripts/install_uv.bat`.
 
 Keep upstream files untouched outside this list. A new mod gets an ID and section in `docs/MODS.md`
@@ -25,7 +26,7 @@ and a marker in `MOD_MARKERS` in `tools/sync_upstream.py`, in the same commit.
 3. Bump `VERSION`, update `docs/MODS.md` if a mod's code changed shape, commit.
 
 ## Non-obvious
-- Model-def keys the fork adds: `clipproj_file`, `tokenizer_folder`. Custom setting id: `h3_refmods`.
+- Model-def keys the fork adds: `clipproj_file`, `tokenizer_folder`. Custom setting id: `h3_refmods` (def keys `hidden`, `tab: "refmods"`); the RefMods tab edits it, so the textbox stays the single source of truth.
 - Upstream `.gitignore` excludes `finetunes/`, `settings/`, `wgp_config.json`, `loras_url_cache_v2.json`, `*.zip`, `*.safetensors`; that is why examples live in `examples/finetune_defs/`.
 - Local-only text-encoder assets: ClipProj models never trigger Hugging Face downloads (M4).
 - Fork has no dependency changes; `requirements.txt` is upstream's.

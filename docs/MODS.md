@@ -2,7 +2,7 @@
 
 Authoritative definition of everything this fork changes relative to upstream
 [deepbeepmeep/Wan2GP](https://github.com/deepbeepmeep/Wan2GP). All code changes live in
-`models/minimax_h3/`. Nothing outside that package alters upstream runtime behaviour.
+`models/minimax_h3/`, except the three-line M8 hook in `wgp.py`, which is inert unless a model def opts in.
 
 Baseline: upstream commit `6479db36` (2026-10-07, WanGP 17.17). The original mod set was
 diffed against that commit: 5 upstream files modified, 2 files added.
@@ -19,6 +19,7 @@ where marked **shared path**.
 | M5 | Audio VAE fused weight-norm re-parametrization | `minimax_h3_main.py` |
 | M6 | LoRA `final_layer` key normalization | `transformer.py` |
 | M7 | RefMods (precomputed reference latents) | `refmods.py`, `pipeline.py`, `minimax_h3_handler.py` |
+| M8 | RefMods tab beside LoRAs (dropdowns + weights) | `refmods_ui.py`, `refmods.py`, `minimax_h3_handler.py`, `wgp.py` |
 
 ---
 
@@ -126,15 +127,21 @@ Tensor data is copied unchanged.
 
 Injects precomputed reference latents (`.safetensors`) as extra visual/audio references.
 
-UI: a text custom setting `h3_refmods` ("RefMods") defined in `minimax_h3_handler.py`.
+UI: a text custom setting `h3_refmods` ("RefMods") defined in `minimax_h3_handler.py`. It is hidden in the form
+and edited through the M8 tab. It is stored and saved like any custom setting.
 
 Spec grammar (`parse_refmod_spec`): entries separated by `,` `;` or newline;
-`name[#visual|#audio|#all][:strength]`. Strength is a float in [0, 1], default 1. `#part` filters which
-member kinds are kept (default `all`). Strength 0 drops the entry.
+`name[#visual|#audio|#all][:weight]`. Weight is a float in [0, 10], default 1. `#part` filters which
+member kinds are kept (default `all`). Weight 0 drops the entry.
+
+Weight semantics (`load_refmods`): up to 1 the weight is the strength below. Above 1 the entry is repeated:
+`floor(w)` full-strength copies, plus one copy at strength `w - floor(w)` when that is non-zero
+(2.7 -> 1.0, 1.0, 0.7). Each copy adds its tokens to every attention block.
 
 File lookup (`resolve_refmod_path`): `.safetensors` is appended if missing; absolute paths are used as-is;
-otherwise searched under `refmods/`, `ckpts/refmods/`, `loras/refmods/`, `loras/minimax_h3/refmods/`
-and the repo root, then by case-insensitive filename across the first four folders (recursive).
+otherwise searched under `refmods/`, `ckpts/refmods/`, `loras/refmods/`, `loras/minimax_h3/refmods/`,
+`loras/refmods_plugin/minimax_h3/` (the community WanGP plugin's folder) and the repo root, then by
+case-insensitive filename across the first five folders (recursive).
 
 File formats (`_read_file`):
 - single tensor: key `latent` (or the only tensor in the file); optional metadata JSON from safetensors
@@ -153,6 +160,30 @@ Pipeline (`pipeline.py`):
 - Phase 2 (two-phase generation): the same mods are re-added to the phase-2 reference lists
   (visual before audio refs when phase-2 refs are rebuilt from phase-1 visual refs; both otherwise).
 - `ref_entry(mod)` builds the ref descriptor (`kind`, `latent_h/w`, and `latent_t`/`ref_audio_t` as applicable).
+
+## M8. RefMods tab
+
+A "RefMods" tab placed directly after the LoRAs tab in the generation settings, built by
+`build_refmods_tab(spec_box)` in `refmods_ui.py`.
+
+Widgets: 8 rows of `[RefMod dropdown | Applies To (all/visual/audio) | Weight slider 0-10, step 0.05]`,
+plus Refresh List and Clear All buttons. The dropdown lists `list_refmod_choices()`: every `.safetensors`
+under the first five `SEARCH_DIRS` folders, as a folder-relative name without extension. Names containing
+`, ; # :` are hidden (they cannot be written in the spec). The dropdown accepts custom values, so a saved
+spec naming an unlisted file is preserved. The list refreshes on tab select and on Refresh List.
+
+Sync with the setting: the tab does not hold state of its own. The hidden `h3_refmods` textbox is the single
+source of truth.
+- Widget `.input` (user edits only) -> `serialize_refmod_spec` -> textbox. Empty rows are skipped; part `all`
+  and weight 1 are omitted from the string.
+- Textbox `.change` (loading settings, switching models, Clear All) -> `parse_refmod_spec` -> widgets.
+  An unreadable spec blanks the rows and is logged. Only the first 8 entries are shown (logged when more exist).
+
+Hook in `wgp.py` (generic, opt-in by model def):
+- `custom_setting_visible(..., ignore_hidden=False)`: a setting def with `"hidden": True` is not shown in the form.
+  The generation-info summary passes `ignore_hidden=True`, so a hidden setting still appears there.
+- After the LoRAs tab, for each custom setting def with `"tab": "refmods"`, `build_refmods_tab` is called with that
+  setting's textbox.
 
 ---
 

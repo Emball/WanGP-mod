@@ -928,8 +928,8 @@ def input_video_strength_visible(model_def, image_prompt_type, video_prompt_type
     )
 
 
-def custom_setting_visible(setting_def, video_prompt_type="", audio_prompt_type=""):
-    if not isinstance(setting_def, dict): return False
+def custom_setting_visible(setting_def, video_prompt_type="", audio_prompt_type="", ignore_hidden=False):
+    if not isinstance(setting_def, dict) or (setting_def.get("hidden") and not ignore_hidden): return False
     vflags, aflags = str(setting_def.get("video_prompt_type", "") or ""), str(setting_def.get("audio_prompt_type", "") or "")
     vflags_not, aflags_not = str(setting_def.get("video_prompt_type_not", "") or ""), str(setting_def.get("audio_prompt_type_not", "") or "")
     if vflags_not and any_letters(video_prompt_type or "", vflags_not): return False
@@ -5369,7 +5369,7 @@ def format_media_info(file_name, configs):
             if isinstance(video_custom_settings, dict):
                 custom_settings = get_model_custom_settings(model_def)
                 for idx, setting_def in enumerate(custom_settings):
-                    if not custom_setting_visible(setting_def, video_video_prompt_type, video_audio_prompt_type):
+                    if not custom_setting_visible(setting_def, video_video_prompt_type, video_audio_prompt_type, ignore_hidden=True):
                         continue
                     setting_id = setting_def.get("id", get_custom_setting_id(setting_def, idx))
                     setting_value = video_custom_settings.get(setting_id, None)
@@ -12846,6 +12846,10 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
                             search_empty_label="No matching LoRAs",
                         )
                         loras_multipliers = gr.Textbox(label="LoRAs Multipliers (1.0 by default) separated by Space chars or CR, lines that start with # are ignored", value=launch_multis_str)
+                for refmods_index, refmods_def in enumerate(custom_settings):
+                    if refmods_def.get("tab") == "refmods":
+                        from models.minimax_h3.refmods_ui import build_refmods_tab
+                        build_refmods_tab(custom_setting_text_inputs[refmods_index])
                 with gr.Tab("Steps Skipping", visible=any_tea_cache or any_mag_cache or any_spectrum_cache or any_first_block_cache) as speed_tab:
                     with gr.Column():
                         gr.Markdown("<B>Step-skipping accelerators avoid selected full transformer evaluations. More skipped evaluations may reduce output quality.</B>")

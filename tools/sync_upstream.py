@@ -24,6 +24,11 @@ MOD_MARKERS = {
     "M7 module": ("models/minimax_h3/refmods.py", "def load_refmods"),
     "M7 pipeline": ("models/minimax_h3/pipeline.py", "split_mods(load_refmods"),
     "M7 handler": ("models/minimax_h3/minimax_h3_handler.py", "H3_REFMODS_SETTING"),
+    "M7 copies": ("models/minimax_h3/refmods.py", "[1.0] * whole"),
+    "M8 tab": ("models/minimax_h3/refmods_ui.py", "def build_refmods_tab"),
+    "M8 handler": ("models/minimax_h3/minimax_h3_handler.py", '"tab": "refmods"'),
+    "M8 wgp hook": ("wgp.py", "build_refmods_tab(custom_setting_text_inputs"),
+    "M8 wgp hidden": ("wgp.py", "ignore_hidden=True"),
 }
 
 

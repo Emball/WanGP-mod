@@ -616,9 +616,11 @@ class family_handler:
             }, {
                 "id": H3_REFMODS_SETTING,
                 "name": "RefMods",
-                "label": "RefMods (files from the refmods folder, comma separated, optional #visual / #audio and :strength, e.g. alice, bob:0.8)",
+                "label": "RefMods (files from the refmods folder, comma separated, optional #visual / #audio and :weight, e.g. alice, bob:0.8)",
                 "type": "text",
                 "default": "",
+                "hidden": True,
+                "tab": "refmods",
             }],
             "switch_threshold": {
                 "label": "Phase 2 Noise Level Start",
